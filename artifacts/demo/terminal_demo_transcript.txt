@@ -1,0 +1,279 @@
+# 1. Invoice workflow planning
+$ paypal-agent --provider codex --once 'I need to create and send a $50 PayPal invoice to buyer@example.com for consulting work. What exact tools would you use, and what information is still missing before execution?' --no-color
+exit_code=0
+assistant>
+[shortlist_tools]
+[route_request]
+[prepare_paypal_plan]
+[orchestrate_answer]
+[record_request]
+I would use these tools in order:
+
+1. `paypal_invoices_invoices_create_draft_invoice`
+2. `paypal_invoices_invoices_send_invoice`
+
+Execution flow: create the draft invoice first, capture the returned `invoice_id`, then send that invoice using `paypal_invoices_invoices_send_invoice`.
+
+Still missing before execution:
+- Currency code, unless you want USD
+- Invoice due date or payment terms
+- Seller/invoicer details, if not already configured
+- Confirmed line item: item name/description, quantity, and unit amount
+- `invoice_id`, which only exists after draft creation
+
+Both steps are mutating PayPal actions and require confirmation before execution. No PayPal request has been executed.
+route: intent=paypal_tool mode=codex confidence=0.93
+selected_tools=paypal_invoices_invoices_create_draft_invoice, paypal_invoices_invoices_send_invoice
+
+# 2. PayPal docs RAG
+$ paypal-agent --provider bedrock --once 'Search the local PayPal docs and explain the correct two-step invoice flow: create a draft invoice, then send it.' --no-color
+exit_code=0
+assistant>
+[shortlist_tools]
+[route_request]
+[run_rag_tool]
+[orchestrate_answer]
+[record_request]
+## Two-Step Invoice Flow (PayPal Invoicing v2)
+
+PayPal uses an intentional two-step design for invoicing: creation is separated from delivery so you can review, edit, or delete drafts before the payer ever sees them.
+
+---
+
+### Step 1: Create a Draft Invoice
+
+**Endpoint:** `POST /v2/invoicing/invoices`
+
+- Creates an invoice in **DRAFT** state.
+- Your request body must include:
+  - Merchant information (PayPal account in good standing)
+  - An **`items` array** (required)
+  - Other details as needed (payer info, amounts, due date, etc.)
+- A draft invoice is **not visible or payable** by the payer — it exists only on your side for review/editing.
+- On success, PayPal returns the invoice object with a generated ID (e.g., `INV2-XXXX-XXXX-XXXX-XXXX`).
+
+---
+
+### Step 2: Send the Invoice
+
+**Endpoint:** `POST /v2/invoicing/invoices/{invoice_id}/send`
+
+- Transitions the invoice from **DRAFT → SENT**.
+- The payer receives an email notification and the invoice becomes payable.
+
+---
+
+### Why Two Steps?
+
+> *"Creates a draft invoice. To move the invoice from a draft to payable state, you must **send** the invoice."*
+
+This lets you safely build, review, and modify invoices before committing to deliver them.
+
+---
+
+### Invoice Status Lifecycle
+
+| Status | Meaning |
+|--------|---------|
+| **DRAFT** | Not yet sent to payer |
+| **SENT** | Awaiting payment |
+| **SCHEDULED** | Will be sent on a future date |
+| **PAID** | Payer has paid in full |
+| **PARTIALLY_PAID** | Partial payment received |
+| **MARKED_AS_PAID** | Manually marked paid by invoicer |
+| **CANCELLED** | Cancelled by invoicer |
+| **REFUNDED** | Refunded by invoicer |
+
+---
+
+Let me know if you'd like help constructing the actual API request bodies or if you'd like me to create and send an invoice on your behalf!
+route: intent=rag_pipeline_search mode=bedrock confidence=0.95
+selected_tools=rag_pipeline_search
+
+# 3. Capability discovery
+$ paypal-agent --provider bedrock --once 'Which PayPal tools do you have for refunds, disputes, webhooks, and transaction search? List exact tool names and when to use each.' --no-color
+exit_code=0
+assistant>
+[shortlist_tools]
+[route_request]
+[run_system_search]
+[orchestrate_answer]
+[record_request]
+# PayPal Tools Available for Refunds, Disputes, Webhooks, and Transaction Search
+
+Here's a complete breakdown of the tools I currently have access to:
+
+---
+
+## 🔍 Transaction Search — ✅ 2 tools available
+
+| Tool Name | When to Use |
+|-----------|-------------|
+| **`paypal_transaction_search_list_transactions`** | Search and list transactions with filters (date range, payer info, shipping info, etc.). Use when you need to find specific transactions or pull transaction history. Note: up to 3-hour delay for new transactions; covers the previous 3 years. |
+| **`paypal_transaction_search_list_all_balances`** | List all account balances (optionally at a specific point in time). Use when you need to check current or historical balances across currencies. Covers the previous 3 years. |
+
+---
+
+## ⚖️ Disputes — ✅ 3 tools available
+
+| Tool Name | When to Use |
+|-----------|-------------|
+| **`paypal_disputes_list_disputes`** | List all disputes with summary details (ID, reason, status, amount, timestamps). Use to get an overview of open/closed disputes or find a specific dispute ID. |
+| **`paypal_disputes_provide_supporting_information_for_dispute`** | Submit supporting notes/documents during CHARGEBACK, PRE_ARBITRATION, or ARBITRATION stages. Use when the `provide-supporting-info` HATEOAS link is available. |
+| **`paypal_disputes_provide_evidence`** | Upload evidence (proof of delivery, proof of refund, documents, notes). Use when dispute status is `WAITING_FOR_SELLER_RESPONSE` or `WAITING_FOR_BUYER_RESPONSE`. Supports JPG, GIF, PNG, PDF (max 10 MB per file, 50 MB total). |
+
+---
+
+## 💸 Refunds — ❌ Not currently loaded
+
+I do not have a standalone refund tool (e.g., `paypal_payments_refund_captured_payment`) in my current toolset. If you need to process a refund, let me know and I can flag this or explore alternatives.
+
+---
+
+## 🔔 Webhooks — ❌ Not currently loaded
+
+I do not have webhook management tools (e.g., create/list webhooks, list event types, verify signatures) available at this time.
+
+---
+
+## Summary
+
+| Category | Status |
+|----------|--------|
+| Transaction Search | ✅ 2 tools |
+| Disputes | ✅ 3 tools |
+| Refunds | ❌ Not available |
+| Webhooks | ❌ Not available |
+
+**Ready to help** with any of the available tools — just provide the required parameters (date ranges for transaction search, dispute IDs for dispute actions, etc.). If you need refund or webhook capabilities, I can flag that as a gap.
+route: intent=system_search mode=bedrock confidence=0.95
+selected_tools=system_search
+
+# 4. Order lookup planning
+$ paypal-agent --provider codex --once 'I have PayPal order id ORDER-FAKE-DEMO-123. Show me the endpoint and path params you would use to retrieve it. Do not mutate anything.' --no-color
+exit_code=0
+assistant>
+[shortlist_tools]
+[route_request]
+[prepare_paypal_plan]
+[orchestrate_answer]
+[record_request]
+Use GET /v2/checkout/orders/{order_id}
+
+Path params:
+order_id=ORDER-FAKE-DEMO-123
+
+This is read-only and does not mutate anything. No PayPal request was executed.
+route: intent=paypal_tool mode=codex confidence=1.0
+selected_tools=paypal_orders_show_order_details
+
+# 5. Refund safety
+$ paypal-agent --provider bedrock --once 'A customer says they were charged twice. Help me prepare a PayPal refund, but do not call PayPal yet. What IDs, amount, and confirmation do you need?' --no-color
+exit_code=0
+assistant>
+[shortlist_tools]
+[route_request]
+[prepare_clarification]
+[orchestrate_answer]
+[record_request]
+## Refund Preparation — What I Need Before Calling PayPal
+
+No refund has been executed. Here's what I need from you to prepare the request:
+
+| # | Required Input | Description |
+|---|---|---|
+| 1 | **Capture ID** | The PayPal capture ID of the duplicate charge (e.g., `2GG279541U471931P`). Found in your PayPal transaction details or order system. |
+| 2 | **Refund Amount & Currency** | The exact amount and currency to refund (e.g., `25.00 USD`). Full or partial refund of the duplicate? |
+| 3 | **Customer Email or Transaction ID** | So we can verify which payment is the duplicate. |
+| 4 | **Reason / Note** | A brief explanation (e.g., "Customer charged twice for Order #12345 — refunding duplicate capture"). This will appear on the refund record. |
+| 5 | **Your Explicit Confirmation** | Once I assemble the final payload, I'll show it to you for approval before making any API call. |
+
+### Recommended Steps
+
+1. **Verify the duplicate** — Confirm in your PayPal dashboard that two separate captures exist for the same order/customer.
+2. **Identify the correct Capture ID** — Refund the *second* (duplicate) capture, not the original.
+3. **Send me the details above** — I'll draft the exact API request for your review.
+4. **You give the green light** — Only then will I call PayPal.
+
+Please share the missing information whenever you're ready!
+route: intent=clarify mode=bedrock confidence=0.95
+selected_tools=paypal_payments_refund_captured_payment
+
+# 6. Memory recall
+$ paypal-agent --provider codex --once 'Find what you remember locally about buyer@example.com and the invoice demo.' --no-color
+exit_code=0
+assistant>
+[shortlist_tools]
+[route_request]
+[run_memory_find]
+[orchestrate_answer]
+[record_request]
+Local memory search completed. I found no entries matching `buyer@example.com` and “invoice demo.”
+
+No PayPal request was executed.
+route: intent=memory_find mode=codex confidence=0.98
+selected_tools=memory_find
+
+# 7. Memory grep
+$ paypal-agent --provider codex --once 'Grep local memory for buyer@example.com and summarize the matching lines.' --no-color
+exit_code=0
+assistant>
+[shortlist_tools]
+[route_request]
+[run_memory_grep]
+[orchestrate_answer]
+[record_request]
+No local memory matches were found for `buyer@example.com`, so there are no matching lines to summarize.
+route: intent=memory_grep mode=codex confidence=0.99
+selected_tools=memory_grep
+
+# 8. Operational guardrails
+$ paypal-agent --provider bedrock --once 'Before I run this in production, explain the safety checks that prevent accidental live PayPal mutations and how LangSmith tracing helps debug a request.' --no-color
+exit_code=0
+assistant>
+[shortlist_tools]
+[route_request]
+[run_rag_tool]
+[orchestrate_answer]
+[record_request]
+## Safety Checks & LangSmith Tracing — Explained
+
+Here's how this system prevents accidental live PayPal mutations and how LangSmith tracing supports debugging:
+
+---
+
+### 🔒 Safety Checks Preventing Accidental Live Mutations
+
+| Layer | Mechanism | Description |
+|-------|-----------|-------------|
+| **Environment Isolation** | `PAYPAL_MODE=sandbox` env var | All API calls route to `api-m.sandbox.paypal.com` unless explicitly switched to `live`. The agent refuses mutating tools if the mode is unclear. |
+| **Credential Separation** | Distinct `CLIENT_ID` / `CLIENT_SECRET` per environment | Sandbox credentials cannot authenticate against production endpoints and vice versa. |
+| **Router Confirmation Gate** | Intent classification + missing-input detection | Before any mutating action (capture, refund, void, send invoice), the router verifies all required IDs/amounts are explicitly provided by you—never invented. |
+| **Read-First Pattern** | GET before POST | For captures or refunds, the agent first calls a read endpoint (e.g., `GET /v2/checkout/orders/{id}`) to confirm the resource state, then asks you to confirm before executing. |
+| **Idempotency Headers** | `PayPal-Request-Id` | Sent on every POST to prevent duplicate mutations if a retry occurs. |
+| **Tool-Level Guards** | Schema validation | Each tool enforces required fields at the schema level; the LLM cannot bypass missing parameters. |
+
+---
+
+### 🔍 How LangSmith Tracing Helps Debug a Request
+
+| Capability | Benefit |
+|------------|---------|
+| **End-to-End Trace Tree** | Every request produces a trace showing: Router → Tool Selection → API Call → Response Parsing → Final Answer. You can pinpoint exactly where a failure occurred. |
+| **Latency Breakdown** | Each node shows wall-clock time, so you can identify whether a PayPal API call is slow vs. LLM inference. |
+| **Token & Cost Tracking** | Input/output token counts per LLM call help optimize prompt length and cost. |
+| **Input/Output Inspection** | View the exact payload sent to PayPal and the raw response—trivial to spot malformed requests or unexpected errors. |
+| **Feedback & Annotation** | Traces can be marked correct/incorrect, building a regression-testing dataset before production rollout. |
+| **Run Filtering** | Filter by metadata (e.g., `tool_name=capture_payment`, `environment=sandbox`) to audit all mutation attempts. |
+
+---
+
+### ✅ Bottom Line
+
+- **You cannot accidentally hit production** unless you explicitly configure live credentials *and* set the environment to `live`.
+- **Every mutating action** requires user-supplied IDs (never fabricated) and a confirmation step.
+- **LangSmith tracing** gives full observability into every step, letting you catch issues in sandbox before promoting to production.
+
+Let me know if you'd like a deeper dive into any specific layer!
+route: intent=rag_pipeline_search mode=bedrock confidence=0.95
+selected_tools=rag_pipeline_search
