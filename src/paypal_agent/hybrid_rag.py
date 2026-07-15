@@ -24,7 +24,7 @@ class HybridRagPipeline:
                 self.settings,
                 "rag_query_embedding",
                 "embedding",
-                inputs={"query": query},
+                inputs={"query_length": len(query)},
                 metadata={"model_id": self.settings.bedrock_embedding_model_id},
                 tags=["rag", "embedding"],
             ) as trace:
@@ -37,7 +37,7 @@ class HybridRagPipeline:
                 self.settings,
                 "pgvector_hybrid_search",
                 "retriever",
-                inputs={"query": query, "limit": 25},
+                inputs={"query_length": len(query), "limit": 25},
                 tags=["rag", "pgvector"],
             ) as trace:
                 chunks = self.store.hybrid_search(query, embedding, limit=25)
@@ -52,7 +52,7 @@ class HybridRagPipeline:
                 "rag_rerank",
                 "retriever",
                 inputs={
-                    "query": query,
+                    "query_length": len(query),
                     "candidate_count": len(chunks),
                     "top_k": limit,
                 },
@@ -63,28 +63,28 @@ class HybridRagPipeline:
                 trace.end(
                     {
                         "match_count": len(reranked),
-                        "titles": [
-                            chunk["title"] for chunk in reranked[:limit]
-                        ],
+                        "titles": [chunk["title"] for chunk in reranked[:limit]],
                     }
                 )
-        except Exception as exc:
+        except Exception:
             with traceRun(
                 self.settings,
                 "rag_markdown_fallback",
                 "retriever",
-                inputs={"query": query, "limit": limit},
+                inputs={"query_length": len(query), "limit": limit},
                 tags=["rag", "fallback"],
             ) as trace:
                 fallback = self.markdown_fallback.search(query, limit=limit)
                 trace.end(
                     {
                         "match_count": len(fallback["matches"]),
-                        "error": str(exc),
+                        "hybrid_rag_available": False,
                     }
                 )
             fallback["mode"] = "markdown_fallback"
-            fallback["error"] = str(exc)
+            fallback["error"] = (
+                "Hybrid RAG was unavailable; used local markdown fallback."
+            )
             return fallback
 
         return {

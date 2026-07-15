@@ -13,6 +13,7 @@ def test_format_chat_result_includes_route_summary() -> None:
             {
                 "status": "error",
                 "status_code": 404,
+                "paypal_debug_id": "debug-cli-123",
                 "tool": {"tool_name": "paypal_invoices_invoices_send_invoice"},
             }
         ],
@@ -37,3 +38,4 @@ def test_format_chat_result_includes_route_summary() -> None:
     assert "paypal_invoices_invoices_send_invoice" in output
     assert "tool_call=paypal_invoices_invoices_send_invoice" in output
     assert "status_code=404" in output
+    assert "paypal_debug_id=debug-cli-123" in output

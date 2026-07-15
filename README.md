@@ -1,11 +1,11 @@
 # Datazoic PayPal Agent
 
-Production-oriented PayPal tool router built from the public PayPal Postman
+PayPal tool router and execution service built from the public PayPal Postman
 collection linked in the task PDF.
 
 ## What This Contains
 
-- 116 PayPal requests loaded from the Postman collection.
+- 116 PayPal requests loaded into the catalog from the Postman collection.
 - Lexical shortlist routing before model routing.
 - Configurable model provider: Bedrock, OpenAI API, Anthropic API, or local
   Codex CLI auth.
@@ -17,9 +17,15 @@ collection linked in the task PDF.
 - HNSW and IVFFLAT vector indexes plus a GIN index on `tsvector`.
 - System-search support tool over capabilities and recent request logs.
 - Local JSONL memory with `memory_grep` and `memory_find` support tools.
-- Real PayPal execution through environment credentials.
+- Natural-language execution of one exact, validated, read-only PayPal request.
+- Real PayPal execution through sandbox or explicitly selected live credentials.
+- Expiring OAuth token caches for standard and managed-account credentials.
 - Mutation guard requiring both request confirmation and environment approval.
 - Optional LangSmith tracing for chat, routing, RAG, model, and tool spans.
+
+A catalog entry describes a collection request; it is executable only when its
+required inputs, credentials, and request body are available. Limited-release
+PayPal APIs still require the corresponding PayPal account approval.
 
 ## Setup
 
@@ -31,9 +37,14 @@ cp .env.example .env
 Set credentials in `.env`:
 
 ```text
-PAYPAL_ENVIRONMENT=live
+PAYPAL_ENVIRONMENT=sandbox
 PAYPAL_CLIENT_ID=...
 PAYPAL_CLIENT_SECRET=...
+PAYPAL_ACCESS_TOKEN=
+PAYPAL_MANAGED_CLIENT_ID=
+PAYPAL_MANAGED_CLIENT_SECRET=
+PAYPAL_MANAGED_ACCESS_TOKEN=
+PAYPAL_UPLOAD_ROOT=
 PAYPAL_ALLOW_MUTATIONS=false
 MODEL_PROVIDER=bedrock
 MODEL_ROUTER_ENABLED=
@@ -53,7 +64,18 @@ LANGSMITH_ENDPOINT=https://aws.api.smith.langchain.com
 LANGSMITH_WORKSPACE_ID=
 ```
 
-`PAYPAL_ACCESS_TOKEN` can be used instead of client credentials.
+`PAYPAL_ACCESS_TOKEN` can be used instead of standard client credentials. Static
+tokens are never refreshed automatically because they have no reliable expiry
+metadata. For refreshable authentication, omit `PAYPAL_ACCESS_TOKEN` and use
+client credentials; the client caches OAuth tokens until shortly before
+PayPal's `expires_in` time and can refresh once after an authentication failure.
+
+Managed Accounts requests use `PAYPAL_MANAGED_CLIENT_ID` and
+`PAYPAL_MANAGED_CLIENT_SECRET`, or `PAYPAL_MANAGED_ACCESS_TOKEN`; they do not
+fall back to the standard PayPal credentials. These APIs are limited release
+and require an approved PayPal account. `PAYPAL_MANAGED_ACCESS_TOKEN` is likewise
+never refreshed automatically.
+
 Set `LANGSMITH_TRACING=true` only when a local `.env` contains a valid
 LangSmith key. The app never returns or logs the key.
 
@@ -67,6 +89,11 @@ Set `MODEL_PROVIDER` to one of:
 - `anthropic`: direct Anthropic API calls with `ANTHROPIC_API_KEY`.
 - `codex`: shells out to local `codex exec`, so the Codex CLI can reuse the
   user's ChatGPT/Codex login or API-key login.
+
+The Codex subprocess runs ephemerally from an isolated temporary directory with
+a scrubbed environment and read-only permissions. It is intended for a trusted
+local operator; prefer the direct Bedrock, OpenAI, or Anthropic provider for an
+untrusted multi-user service.
 
 Install the terminal UI globally:
 
@@ -100,6 +127,11 @@ uv run python scripts/ingest_paypal_docs.py
 uv run uvicorn paypal_agent.api:app --reload
 ```
 
+The API does not include application-level authentication. The command above
+uses Uvicorn's loopback default and is intended for local use. Do not bind it to
+a public or shared interface unless an authenticated, authorized reverse proxy
+protects every endpoint, especially `/tools/*/call` and `/memory/*`.
+
 Useful endpoints:
 
 ```bash
@@ -108,8 +140,15 @@ curl "http://localhost:8000/tools/search?query=send%20invoice&limit=5"
 curl http://localhost:8000/observability
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
-  -d '{"userInput":"send an invoice for 50 dollars","conversationId":"demo"}'
+  -d '{"userInput":"show order ORDER-123","conversationId":"demo"}'
 ```
+
+`/chat` calls PayPal only when routing produces one unambiguous read-only tool
+and all IDs, dates, and filters are grounded in the user's request. Missing
+inputs, ambiguity, low confidence, or a model-provider failure returns a
+clarification and makes no PayPal request. A mutating chat request also makes
+no PayPal request; it returns an unconfirmed direct-call payload for the user
+to review. The separate direct caller must add confirmation.
 
 Flush buffered LangSmith traces after a demo run:
 
@@ -134,10 +173,9 @@ uv run paypal-agent --once \
 ```
 
 The CLI streams LangGraph node progress by default, then streams the final
-answer text. Use `--no-stream` to print only the final response.
-When chat routes to a PayPal tool, the agent sends one selected PayPal request
-and displays the returned status code, even when PayPal returns `401`, `404`,
-or another non-2xx response.
+answer text. Use `--no-stream` to print only the final response. For an
+executed read, the answer includes the bounded PayPal response along with the
+upstream status and PayPal Debug ID, including non-2xx error details.
 
 Helpful terminal commands:
 
@@ -152,10 +190,17 @@ Helpful terminal commands:
 /quit
 ```
 
-Local memory is append-only JSONL under `MEMORY_DIR`. Chat and PayPal tool
-events are sanitized before writing so tokens and secret-looking fields are
-redacted. The agent can route natural-language memory prompts to `memory_grep`
-or `memory_find`, and the CLI exposes direct `/grep` and `/find` commands.
+Local memory is append-only JSONL under `MEMORY_DIR`. PayPal tool events store
+only tool, status, status code, and PayPal Debug ID metadata; PayPal request and
+response bodies, chat prompts, and raw conversation IDs are not written to
+durable JSONL memory. `memory_grep` and `memory_find` return only an explicit
+metadata allowlist, including when they read files created by an older version.
+The in-process recent-request log is also metadata-only. Delete pre-upgrade
+JSONL files under `MEMORY_DIR` if the sensitive values must also be removed from
+disk. Raw PayPal results are returned to the requesting user, but operational
+PayPal responses and mutation plans are rendered deterministically rather than
+sent to an answer model. Optional LangSmith tracing should still be enabled only
+under the operator's data handling policy.
 
 ## Terminal Demo
 
@@ -181,11 +226,41 @@ curl -X POST http://localhost:8000/tools/paypal_orders_show_order_details/call \
   -d '{"pathParams":{"order_id":"ORDER_ID"}}'
 ```
 
+Each result keeps the full upstream payload under `response`, the upstream
+HTTP code under `status_code`, and the response-header value under
+`paypal_debug_id`. List and search calls return one PayPal page per tool call;
+the service does not automatically follow `next` links. Supply `page` and
+`page_size` query values for another bounded page, and use the returned PayPal
+links as pagination metadata.
+
+Transaction Search requires `start_date` and `end_date`, accepts either
+`YYYY-MM-DD` or RFC3339 timestamps, and rejects ranges longer than 31 days. It
+defaults to `page=1` and `page_size=100`, clamps `page_size` to 100, and still
+sends only that one page.
+
+The direct tool endpoint supports collection-declared raw JSON, URL-encoded,
+and multipart request bodies. Multipart calls are rejected unless
+`PAYPAL_UPLOAD_ROOT` is configured. Every caller-supplied file path must resolve
+beneath that directory; the service opens it only for the duration of the
+request. All body modes require exact caller-supplied values rather than
+Postman sample files or bodies.
+
+The collection's Appeal dispute entry declares a raw `multipart/related` body
+that cannot be encoded safely from its metadata. It is marked unsupported in
+the catalog and rejected before any HTTP request. Use a corrected
+`multipart/form-data` definition before enabling that operation.
+
 Mutating calls require:
 
 - `PAYPAL_ALLOW_MUTATIONS=true`
 - request JSON with `"confirm": true`
 - exact body/path/query values supplied by the caller
+
+Natural-language chat never satisfies this confirmation gate. It only returns
+an unconfirmed direct-call payload for explicit review. A separate direct
+caller must add `"confirm": true` after that review. For POST mutations, the
+reviewed plan includes a stable `PayPal-Request-Id`; reuse the same value for
+every retry so an ambiguous timeout cannot create a duplicate operation.
 
 ## Production Collection Run
 

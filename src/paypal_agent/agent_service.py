@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Literal, NotRequired, TypedDict, cast
@@ -13,6 +15,8 @@ from paypal_agent.hybrid_rag import HybridRagPipeline
 from paypal_agent.local_memory import LocalMemoryStore
 from paypal_agent.model_router import (
     BedrockRuntimeClient,
+    RoutedToolInput,
+    RouterDecision,
     RouteResult,
     SmallModelRouter,
 )
@@ -20,7 +24,11 @@ from paypal_agent.package_assets import (
     defaultKnowledgeBasePath,
     resolvePostmanCollectionPath,
 )
-from paypal_agent.paypal_client import PayPalClient, ToolCallInput
+from paypal_agent.paypal_client import (
+    ClientInputError,
+    PayPalClient,
+    ToolCallInput,
+)
 from paypal_agent.postman import ApiTool
 from paypal_agent.system_search import RequestLog, SystemSearch
 from paypal_agent.tool_registry import ToolRegistry
@@ -105,8 +113,8 @@ class AgentService:
             self.settings,
             "paypal_agent_chat",
             inputs={
-                "conversation_id": conversation_id,
-                "user_input": user_input,
+                "conversation_id_length": len(conversation_id),
+                "user_input_length": len(user_input),
             },
             metadata={
                 "paypal_tool_count": len(self.registry.tools),
@@ -130,7 +138,7 @@ class AgentService:
                     "intent": route_result.decision.intent,
                     "selected_tool_names": route_result.decision.selected_tool_names,
                     "router_mode": route_result.mode,
-                    "answer": result["answer"],
+                    "answer_length": len(result["answer"]),
                 }
             )
             return result
@@ -144,8 +152,8 @@ class AgentService:
             self.settings,
             "paypal_agent_chat",
             inputs={
-                "conversation_id": conversation_id,
-                "user_input": user_input,
+                "conversation_id_length": len(conversation_id),
+                "user_input_length": len(user_input),
             },
             metadata={
                 "paypal_tool_count": len(self.registry.tools),
@@ -204,7 +212,7 @@ class AgentService:
                             finalRoute.decision.selected_tool_names
                         ),
                         "router_mode": finalRoute.mode,
-                        "answer": finalResult["answer"],
+                        "answer_length": len(finalResult["answer"]),
                     }
                 )
             yield ChatStreamEvent(event="result", result=finalResult)
@@ -256,15 +264,48 @@ class AgentService:
         self,
         state: ChatGraphState,
     ) -> dict[str, RouteResult]:
+        routeResult: RouteResult = await self._route_request(
+            state["user_input"],
+            self._state_candidates(state),
+        )
         return {
-            "route_result": await self._route_request(
-                state["user_input"],
-                self._state_candidates(state),
-            )
+            "route_result": self._requireMutationBody(routeResult),
         }
 
+    def _requireMutationBody(self, routeResult: RouteResult) -> RouteResult:
+        decision: RouterDecision = routeResult.decision
+        if len(decision.selected_tool_names) != 1 or decision.tool_input is None:
+            return routeResult
+        tool: ApiTool = self.registry.get(decision.selected_tool_names[0])
+        if not tool.is_mutating or not _mutationBodyIsMissing(
+            tool,
+            decision.tool_input.body,
+        ):
+            return routeResult
+        missingInputs: list[str] = list(decision.missing_inputs)
+        if "body" not in missingInputs:
+            missingInputs.append("body")
+        updatedDecision: RouterDecision = decision.model_copy(
+            update={
+                "missing_inputs": missingInputs,
+                "user_message": (
+                    "I need the exact non-empty request body before "
+                    "preparing this mutating PayPal call."
+                ),
+            }
+        )
+        return RouteResult(
+            decision=updatedDecision,
+            mode=routeResult.mode,
+            error=routeResult.error,
+        )
+
     def _graph_route_key(self, state: ChatGraphState) -> GraphRoute:
-        intent = self._state_route_result(state).decision.intent
+        routeResult = self._state_route_result(state)
+        decision = routeResult.decision
+        if routeResult.error or decision.missing_inputs or decision.confidence < 0.5:
+            return "clarify"
+        intent = decision.intent
         if intent == "rag_pipeline_search":
             return "rag"
         if intent == "system_search":
@@ -274,6 +315,8 @@ class AgentService:
         if intent == "memory_find":
             return "memory_find"
         if intent == "clarify":
+            return "clarify"
+        if len(decision.selected_tool_names) != 1 or decision.tool_input is None:
             return "clarify"
         return "paypal"
 
@@ -288,27 +331,21 @@ class AgentService:
         self,
         state: ChatGraphState,
     ) -> dict[str, Any]:
-        fallbackAnswer, routePayload = self._system_search_answer(
-            state["user_input"]
-        )
+        fallbackAnswer, routePayload = self._system_search_answer(state["user_input"])
         return {"fallback_answer": fallbackAnswer, "route_payload": routePayload}
 
     def _graph_run_memory_grep(
         self,
         state: ChatGraphState,
     ) -> dict[str, Any]:
-        fallbackAnswer, routePayload = self._memory_grep_answer(
-            state["user_input"]
-        )
+        fallbackAnswer, routePayload = self._memory_grep_answer(state["user_input"])
         return {"fallback_answer": fallbackAnswer, "route_payload": routePayload}
 
     def _graph_run_memory_find(
         self,
         state: ChatGraphState,
     ) -> dict[str, Any]:
-        fallbackAnswer, routePayload = self._memory_find_answer(
-            state["user_input"]
-        )
+        fallbackAnswer, routePayload = self._memory_find_answer(state["user_input"])
         return {"fallback_answer": fallbackAnswer, "route_payload": routePayload}
 
     def _graph_prepare_clarification(
@@ -318,7 +355,11 @@ class AgentService:
         decision = self._state_route_result(state).decision
         return {
             "fallback_answer": decision.user_message,
-            "route_payload": {"missing_inputs": decision.missing_inputs},
+            "route_payload": {
+                "missing_inputs": decision.missing_inputs,
+                "router_decision": decision.model_dump(by_alias=True),
+                "router_error": self._state_route_result(state).error,
+            },
         }
 
     async def _graph_prepare_paypal_plan(
@@ -326,7 +367,7 @@ class AgentService:
         state: ChatGraphState,
     ) -> dict[str, Any]:
         fallbackAnswer, routePayload = await self._paypal_answer(
-            self._state_route_result(state).decision.selected_tool_names
+            self._state_route_result(state).decision
         )
         return {"fallback_answer": fallbackAnswer, "route_payload": routePayload}
 
@@ -350,24 +391,34 @@ class AgentService:
         candidates = self._state_candidates(state)
         self.request_log.append(
             {
-                "conversation_id": state["conversation_id"],
-                "user_input": state["user_input"],
+                "event_type": "chat",
+                "conversation_id_length": len(state["conversation_id"]),
+                "user_input_length": len(state["user_input"]),
                 "intent": routeResult.decision.intent,
                 "selected_tool_names": routeResult.decision.selected_tool_names,
                 "router_mode": routeResult.mode,
             }
         )
-        self.memory.append(
-            "chat",
-            {
-                "conversation_id": state["conversation_id"],
-                "user_input": state["user_input"],
-                "answer": self._state_answer(state),
-                "intent": routeResult.decision.intent,
-                "selected_tool_names": routeResult.decision.selected_tool_names,
-                "router_mode": routeResult.mode,
-            },
+        memoryEvent: dict[str, Any] = {
+            "conversation_id_length": len(state["conversation_id"]),
+            "user_input_length": len(state["user_input"]),
+            "intent": routeResult.decision.intent,
+            "selected_tool_names": routeResult.decision.selected_tool_names,
+            "router_mode": routeResult.mode,
+        }
+        toolResults = self._state_route_payload(state).get(
+            "tool_call_results",
+            [],
         )
+        memoryEvent["tool_results"] = [
+            _tool_result_metadata(result)
+            for result in toolResults
+            if isinstance(result, dict)
+        ]
+        try:
+            self.memory.append("chat", memoryEvent)
+        except OSError:
+            pass
         return {
             "result": {
                 "answer": self._state_answer(state),
@@ -377,6 +428,9 @@ class AgentService:
                     [],
                 ),
                 "router_decision": routeResult.decision.model_dump(),
+                "required_direct_call": self._state_route_payload(state).get(
+                    "required_direct_call"
+                ),
                 "metadata": {
                     "router_mode": routeResult.mode,
                     "router_error": routeResult.error,
@@ -411,7 +465,10 @@ class AgentService:
             self.settings,
             "tool_registry_shortlist",
             "retriever",
-            inputs={"query": user_input, "limit": self.settings.max_selected_tools},
+            inputs={
+                "query_length": len(user_input),
+                "limit": self.settings.max_selected_tools,
+            },
             tags=["router", "shortlist"],
         ) as trace:
             candidates = self.registry.search(
@@ -420,9 +477,7 @@ class AgentService:
             )
             trace.end(
                 {
-                    "candidate_tool_names": [
-                        tool.tool_name for tool in candidates
-                    ],
+                    "candidate_tool_names": [tool.tool_name for tool in candidates],
                     "candidate_count": len(candidates),
                 }
             )
@@ -437,7 +492,7 @@ class AgentService:
             self.settings,
             "small_model_router",
             inputs={
-                "user_input": user_input,
+                "user_input_length": len(user_input),
                 "candidate_tool_names": [tool.tool_name for tool in candidates],
             },
             metadata={
@@ -449,9 +504,11 @@ class AgentService:
             route_result = await self.router.route(user_input, candidates)
             trace.end(
                 {
-                    "decision": route_result.decision.model_dump(),
+                    "intent": route_result.decision.intent,
+                    "selected_tool_names": (route_result.decision.selected_tool_names),
+                    "missing_input_names": route_result.decision.missing_inputs,
                     "mode": route_result.mode,
-                    "error": route_result.error,
+                    "has_error": route_result.error is not None,
                 }
             )
             return route_result
@@ -467,9 +524,11 @@ class AgentService:
             self.settings,
             "main_orchestrator_answer",
             inputs={
-                "user_input": user_input,
-                "router_decision": route_result.decision.model_dump(),
-                "route_payload": route_payload,
+                "user_input_length": len(user_input),
+                "router_intent": route_result.decision.intent,
+                "selected_tool_names": (route_result.decision.selected_tool_names),
+                "route_payload_keys": list(route_payload),
+                "tool_result_count": len(route_payload.get("tool_call_results", [])),
             },
             metadata={
                 "model_provider": self.settings.model_provider,
@@ -483,7 +542,7 @@ class AgentService:
                 route_payload,
                 fallback_answer,
             )
-            trace.end({"answer": answer})
+            trace.end({"answer_length": len(answer)})
             return answer
 
     async def call_tool(
@@ -497,7 +556,11 @@ class AgentService:
             "tool",
             inputs={
                 "tool_name": tool_name,
-                "payload": payload.model_dump(by_alias=True),
+                "path_parameter_names": list(payload.path_params),
+                "query_parameter_names": list(payload.query),
+                "header_names": list(payload.headers),
+                "has_body": payload.body is not None,
+                "confirmed": payload.confirm,
             },
             tags=["paypal-tool"],
         ) as trace:
@@ -510,16 +573,13 @@ class AgentService:
                     "status_code": result.get("status_code"),
                 }
             )
-            self.memory.append(
-                "paypal_tool",
-                {
-                    "tool_name": tool_name,
-                    "status": result["status"],
-                    "status_code": result.get("status_code"),
-                    "request": result.get("request"),
-                    "response": result.get("response"),
-                },
-            )
+            try:
+                self.memory.append(
+                    "paypal_tool",
+                    _tool_result_metadata(result),
+                )
+            except OSError:
+                pass
             trace.end(
                 {
                     "status": result["status"],
@@ -556,12 +616,11 @@ class AgentService:
             self.settings,
             "tool_catalog_search",
             "retriever",
-            inputs={"query": query, "limit": limit},
+            inputs={"query_length": len(query), "limit": limit},
             tags=["system-search"],
         ) as trace:
             tools = [
-                tool.to_dict()
-                for tool in self.registry.search(query, limit=limit)
+                tool.to_dict() for tool in self.registry.search(query, limit=limit)
             ]
             trace.end(
                 {
@@ -576,7 +635,7 @@ class AgentService:
             self.settings,
             "rag_pipeline_tool",
             "tool",
-            inputs={"query": user_input},
+            inputs={"query_length": len(user_input)},
             tags=["rag"],
         ) as trace:
             result = self.rag.search(user_input)
@@ -584,8 +643,7 @@ class AgentService:
                 trace.end({"match_count": 0})
                 return "No matching local documentation was found.", result
             answer = "\n".join(
-                f"{match['source']}: {match['snippet']}"
-                for match in result["matches"]
+                f"{match['source']}: {match['snippet']}" for match in result["matches"]
             )
             trace.end(
                 {
@@ -600,23 +658,19 @@ class AgentService:
             self.settings,
             "system_search_tool",
             "tool",
-            inputs={"query": user_input},
+            inputs={"query_length": len(user_input)},
             tags=["system-search"],
         ) as trace:
             result = self.system_search.search(user_input)
             trace.end(
                 {
                     "matching_tool_count": len(result["matching_tools"]),
-                    "matching_request_count": len(
-                        result["matching_requests"]
-                    ),
+                    "matching_request_count": len(result["matching_requests"]),
                 }
             )
             return (
                 "Matching tools: "
-                + ", ".join(
-                    tool["tool_name"] for tool in result["matching_tools"][:5]
-                )
+                + ", ".join(tool["tool_name"] for tool in result["matching_tools"][:5])
             ), result
 
     def _memory_grep_answer(self, user_input: str) -> tuple[str, dict[str, Any]]:
@@ -624,7 +678,7 @@ class AgentService:
             self.settings,
             "memory_grep_tool",
             "tool",
-            inputs={"query": user_input},
+            inputs={"query_length": len(user_input)},
             tags=["memory"],
         ) as trace:
             pattern = _memory_query(user_input, command="grep")
@@ -643,7 +697,7 @@ class AgentService:
             self.settings,
             "memory_find_tool",
             "tool",
-            inputs={"query": user_input},
+            inputs={"query_length": len(user_input)},
             tags=["memory"],
         ) as trace:
             query = _memory_query(user_input, command="find")
@@ -659,52 +713,94 @@ class AgentService:
 
     async def _paypal_answer(
         self,
-        selected_tool_names: list[str],
+        decision: RouterDecision,
     ) -> tuple[str, dict[str, Any]]:
-        selectedTools = [
-            self.registry.get(tool_name)
-            for tool_name in selected_tool_names
-            if tool_name in self.registry.by_name
-        ]
-        toolResults: list[dict[str, Any]] = []
-        executionTool = _execution_tool(selectedTools)
-        if executionTool is not None:
-            tool = executionTool
-            payload = _auto_tool_payload(tool)
-            try:
-                result = await self.paypal_client.execute(
-                    tool,
-                    payload,
-                    force_request=True,
-                )
-            except Exception as exc:
-                result = {
-                    "status": "client_error",
-                    "status_code": None,
-                    "tool": tool.to_dict(),
-                    "error": str(exc),
-                }
-            toolResults.append(result)
+        selectedToolNames: list[str] = decision.selected_tool_names
+        routedInput: RoutedToolInput | None = decision.tool_input
+        if len(selectedToolNames) != 1 or routedInput is None:
+            return (
+                "I need one exact PayPal tool and its complete request values.",
+                {"selected_tools": [], "tool_call_results": []},
+            )
 
-        return _format_paypal_tool_results(selectedTools, toolResults), {
-            "selected_tools": [tool.to_dict() for tool in selectedTools],
+        tool: ApiTool = self.registry.get(selectedToolNames[0])
+        payload: ToolCallInput = ToolCallInput(
+            pathParams=routedInput.path_params,
+            query=routedInput.query,
+            body=routedInput.body,
+            headers=routedInput.headers,
+        )
+        if tool.is_mutating:
+            if tool.method == "POST" and not any(
+                name.lower() == "paypal-request-id" for name in payload.headers
+            ):
+                payload = payload.model_copy(
+                    update={
+                        "headers": {
+                            **payload.headers,
+                            "PayPal-Request-Id": str(uuid.uuid4()),
+                        }
+                    }
+                )
+            directPayload: dict[str, Any] = payload.model_dump(
+                by_alias=True,
+                exclude_defaults=True,
+                exclude_none=True,
+            )
+            return _format_mutation_plan(tool, directPayload), {
+                "selected_tools": [tool.to_dict()],
+                "tool_input": routedInput.model_dump(
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+                "required_direct_call": {
+                    "method": "POST",
+                    "path": f"/tools/{tool.tool_name}/call",
+                    "payload": directPayload,
+                    "requires": [
+                        "explicit user review",
+                        "separate direct caller sets confirm=true",
+                        "reuse PayPal-Request-Id for every retry",
+                        "PAYPAL_ALLOW_MUTATIONS=true",
+                    ],
+                },
+                "tool_call_results": [],
+            }
+
+        result: dict[str, Any]
+        try:
+            result = await self.paypal_client.execute(tool, payload)
+        except ClientInputError as error:
+            result = {
+                "status": "rejected",
+                "status_code": None,
+                "request_sent": False,
+                "tool": tool.to_dict(),
+                "error": str(error),
+            }
+        except httpx.TimeoutException:
+            result = {
+                "status": "client_error",
+                "status_code": None,
+                "tool": tool.to_dict(),
+                "error": "PayPal request timed out.",
+            }
+        except httpx.RequestError:
+            result = {
+                "status": "client_error",
+                "status_code": None,
+                "tool": tool.to_dict(),
+                "error": "PayPal request failed before a response was received.",
+            }
+        toolResults: list[dict[str, Any]] = [result]
+        return _format_paypal_tool_results([tool], toolResults), {
+            "selected_tools": [tool.to_dict()],
+            "tool_input": routedInput.model_dump(
+                by_alias=True,
+                exclude_none=True,
+            ),
             "tool_call_results": toolResults,
         }
-
-    def _paypal_plan(self, selected_tool_names: list[str]) -> str:
-        if not selected_tool_names:
-            return "No PayPal tool matched the request."
-        lines: list[str] = []
-        for tool_name in selected_tool_names:
-            if tool_name not in self.registry.by_name:
-                continue
-            tool = self.registry.get(tool_name)
-            required = ", ".join(tool.path_variables) or "none"
-            lines.append(
-                f"- {tool.tool_name}: {tool.method} {tool.path}; "
-                f"required path params: {required}"
-            )
-        return "Selected PayPal tools:\n" + "\n".join(lines)
 
 
 def _memory_query(user_input: str, *, command: str) -> str:
@@ -735,24 +831,6 @@ def _memory_query(user_input: str, *, command: str) -> str:
     return " ".join(terms) or user_input
 
 
-def _auto_tool_payload(tool: ApiTool) -> ToolCallInput:
-    return ToolCallInput(
-        pathParams={
-            name: f"missing_{name}"
-            for name in tool.path_variables
-        }
-    )
-
-
-def _execution_tool(selectedTools: list[ApiTool]) -> ApiTool | None:
-    for tool in selectedTools:
-        if not tool.is_mutating:
-            return tool
-    if not selectedTools:
-        return None
-    return selectedTools[0]
-
-
 def _format_paypal_tool_results(
     selectedTools: list[ApiTool],
     toolResults: list[dict[str, Any]],
@@ -762,7 +840,15 @@ def _format_paypal_tool_results(
     if not toolResults:
         return "Selected PayPal tools:\n" + _paypal_tool_lines(selectedTools)
 
-    lines = ["Executed PayPal tool call:"]
+    if all(result.get("request_sent") is False for result in toolResults):
+        lines: list[str] = ["PayPal request rejected before execution:"]
+    elif all(
+        result.get("status") == "client_error" and result.get("status_code") is None
+        for result in toolResults
+    ):
+        lines = ["PayPal tool call failed before receiving a response:"]
+    else:
+        lines = ["Executed PayPal tool call:"]
     for result in toolResults:
         tool = result.get("tool", {})
         toolName = tool.get("tool_name", "unknown_tool")
@@ -771,12 +857,113 @@ def _format_paypal_tool_results(
         statusCode = result.get("status_code")
         status = result.get("status")
         lines.append(
-            f"- {toolName}: {method} {path}; "
-            f"status={status}; status_code={statusCode}"
+            f"- {toolName}: {method} {path}; status={status}; status_code={statusCode}"
         )
+        paypalDebugId = _paypal_debug_id(result)
+        if paypalDebugId:
+            lines.append(f"  paypal_debug_id={paypalDebugId}")
         if result.get("error"):
             lines.append(f"  error={result['error']}")
+        if result.get("message"):
+            lines.append(
+                "  message=" + str(_bounded_paypal_value(result.get("message")))
+            )
+        if "response" in result:
+            lines.append(
+                "  response="
+                + json.dumps(
+                    _bounded_paypal_value(result.get("response")),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
     return "\n".join(lines)
+
+
+def _format_mutation_plan(
+    tool: ApiTool,
+    directPayload: dict[str, Any],
+) -> str:
+    return (
+        "This mutating PayPal request was not executed. Review the exact "
+        "payload below. A separate direct caller must explicitly confirm it "
+        "and enable PAYPAL_ALLOW_MUTATIONS=true before posting it to "
+        f"/tools/{tool.tool_name}/call:\n"
+        + json.dumps(
+            directPayload,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def _bounded_paypal_value(
+    value: Any,
+    *,
+    depth: int = 0,
+) -> Any:
+    if depth >= 6:
+        return "...[nested response truncated]"
+    if isinstance(value, dict):
+        items = list(value.items())
+        bounded = {
+            str(key): _bounded_paypal_value(child, depth=depth + 1)
+            for key, child in items[:40]
+        }
+        if len(items) > 40:
+            bounded["__truncated__"] = f"{len(items) - 40} fields omitted"
+        return bounded
+    if isinstance(value, list):
+        boundedList = [
+            _bounded_paypal_value(child, depth=depth + 1) for child in value[:10]
+        ]
+        if len(value) > 10:
+            boundedList.append(f"...{len(value) - 10} items omitted")
+        return boundedList
+    if isinstance(value, str) and len(value) > 1000:
+        return value[:1000] + "...[truncated]"
+    return value
+
+
+def _mutationBodyIsMissing(tool: ApiTool, body: Any) -> bool:
+    template: Any = tool.body_template
+    if template is None:
+        return False
+    if isinstance(template, dict):
+        return not isinstance(body, dict) or not body
+    if isinstance(template, list):
+        return not isinstance(body, list) or not body
+    if isinstance(template, str):
+        return not isinstance(body, str) or not body.strip()
+    return body is None
+
+
+def _tool_result_metadata(result: dict[str, Any]) -> dict[str, Any]:
+    tool = result.get("tool")
+    toolName = tool.get("tool_name") if isinstance(tool, dict) else None
+    return {
+        "tool_name": toolName,
+        "status": result.get("status"),
+        "status_code": result.get("status_code"),
+        "paypal_debug_id": _paypal_debug_id(result),
+    }
+
+
+def _paypal_debug_id(result: dict[str, Any]) -> str | None:
+    paypalDebugId = result.get("paypal_debug_id")
+    if isinstance(paypalDebugId, str):
+        return paypalDebugId
+    debugId = result.get("debug_id")
+    if isinstance(debugId, str):
+        return debugId
+    response = result.get("response")
+    if isinstance(response, dict):
+        responseDebugId = response.get("debug_id")
+        if isinstance(responseDebugId, str):
+            return responseDebugId
+    return None
 
 
 def _paypal_tool_lines(selectedTools: list[ApiTool]) -> str:

@@ -3,6 +3,13 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 from types import ModuleType
+from typing import Any
+
+import httpx
+import pytest
+
+from paypal_agent.paypal_client import ToolCallInput
+from paypal_agent.postman import ApiTool
 
 
 def test_runner_summary_counts_statuses() -> None:
@@ -26,6 +33,40 @@ def test_runner_summary_counts_statuses() -> None:
         "client_errors": 1,
         "requires_confirmation": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_runner_maps_paypal_network_errors() -> None:
+    module: ModuleType = _load_runner()
+
+    class FailingService:
+        async def call_tool(
+            self,
+            _toolName: str,
+            _payload: ToolCallInput,
+        ) -> dict[str, Any]:
+            raise httpx.ConnectError("connection failed")
+
+    tool: ApiTool = ApiTool(
+        tool_name="paypal_test_read",
+        display_name="Test read",
+        folder_path="Test",
+        method="GET",
+        raw_url="{{base_url}}/v1/test",
+        path="/v1/test",
+        description="",
+    )
+
+    result: dict[str, Any] = await module._run_tool(
+        FailingService(),
+        tool,
+        {},
+        include_mutations=False,
+        confirm_mutations=False,
+    )
+
+    assert result["status"] == "client_error"
+    assert result["error"] == "PayPal request failed."
 
 
 def _load_runner() -> ModuleType:

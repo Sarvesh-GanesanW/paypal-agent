@@ -14,10 +14,14 @@ CodexSandboxMode = Literal["read-only", "workspace-write", "danger-full-access"]
 
 class Settings(BaseSettings):
     app_name: str = "Datazoic PayPal Agent"
-    paypal_environment: Literal["sandbox", "live"] = "live"
+    paypal_environment: Literal["sandbox", "live"] = "sandbox"
     paypal_client_id: str | None = None
     paypal_client_secret: SecretStr | None = None
     paypal_access_token: SecretStr | None = None
+    paypal_managed_client_id: str | None = None
+    paypal_managed_client_secret: SecretStr | None = None
+    paypal_managed_access_token: SecretStr | None = None
+    paypal_upload_root: Path | None = None
     paypal_allow_mutations: bool = False
     paypal_postman_collection_path: Path = Field(
         default_factory=defaultPostmanCollectionPath
@@ -28,9 +32,7 @@ class Settings(BaseSettings):
     model_router_enabled: bool | None = None
     aws_region: str = "us-east-1"
     bedrock_router_enabled: bool = True
-    bedrock_router_model_id: str = (
-        "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-    )
+    bedrock_router_model_id: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
     bedrock_main_model_id: str = "us.anthropic.claude-opus-4-6-v1"
     bedrock_subagent_model_id: str = "us.anthropic.claude-opus-4-6-v1"
     bedrock_embedding_model_id: str = "cohere.embed-v4:0"
@@ -50,11 +52,9 @@ class Settings(BaseSettings):
     router_timeout_seconds: float = Field(default=20.0, gt=0)
     postgres_dsn: str = "postgresql://postgres:postgres@localhost:5432/paypal_agent"
     memory_dir: Path = Field(
-        default_factory=lambda: Path.home()
-        / ".local"
-        / "share"
-        / "paypal-agent"
-        / "memory"
+        default_factory=lambda: (
+            Path.home() / ".local" / "share" / "paypal-agent" / "memory"
+        )
     )
     langsmith_tracing: bool = False
     langsmith_api_key: SecretStr | None = None
@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
+        env_ignore_empty=True,
         extra="ignore",
     )
 

@@ -4,16 +4,27 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 POSTMAN_COLLECTION_URL = (
-    "https://www.postman.com/collections/"
-    "19024122-92a85d0e-51e7-47da-9f83-c45dcb1cdf24"
+    "https://www.postman.com/collections/19024122-92a85d0e-51e7-47da-9f83-c45dcb1cdf24"
 )
 VARIABLE_PATTERN = re.compile(r"{{([^{}]+)}}")
 PATH_VARIABLE_PATTERN = re.compile(r"/:([A-Za-z_][A-Za-z0-9_]*)")
+SENSITIVE_VARIABLE_NAMES = {"client_id", "managed_path_client_id"}
+SENSITIVE_VARIABLE_PARTS = (
+    "assertion",
+    "credential",
+    "password",
+    "script",
+    "secret",
+    "signature",
+    "token",
+)
+
+BodyMode = Literal["raw", "urlencoded", "formdata"]
 
 
 @dataclass(frozen=True)
@@ -28,11 +39,33 @@ class ApiTool:
     headers: dict[str, str] = field(default_factory=dict)
     query_params: dict[str, str] = field(default_factory=dict)
     path_variables: tuple[str, ...] = ()
+    collection_variables: dict[str, str] = field(default_factory=dict)
+    auth_type: str | None = None
+    auth_token_variable: str | None = None
+    body_mode: BodyMode | None = None
     body_template: Any = None
+    multipart_file_fields: tuple[str, ...] = ()
+    multipart_content_types: dict[str, str] = field(default_factory=dict)
 
     @property
     def is_mutating(self) -> bool:
         return self.method in MUTATING_METHODS
+
+    @property
+    def unsupported_reason(self) -> str | None:
+        content_type = next(
+            (
+                value
+                for key, value in self.headers.items()
+                if key.lower() == "content-type"
+            ),
+            "",
+        )
+        if self.body_mode == "raw" and content_type.lower().startswith(
+            "multipart/related"
+        ):
+            return "multipart/related request encoding is not supported."
+        return None
 
     @property
     def search_text(self) -> str:
@@ -47,6 +80,7 @@ class ApiTool:
         return " ".join(part for part in parts if part).lower()
 
     def to_dict(self) -> dict[str, Any]:
+        unsupported_reason = self.unsupported_reason
         return {
             "tool_name": self.tool_name,
             "display_name": self.display_name,
@@ -57,8 +91,14 @@ class ApiTool:
             "headers": self.headers,
             "query_params": self.query_params,
             "path_variables": list(self.path_variables),
+            "auth_type": self.auth_type,
+            "auth_token_variable": self.auth_token_variable,
+            "body_mode": self.body_mode,
+            "multipart_file_fields": list(self.multipart_file_fields),
             "has_body_template": self.body_template is not None,
             "is_mutating": self.is_mutating,
+            "is_supported": unsupported_reason is None,
+            "unsupported_reason": unsupported_reason,
         }
 
 
@@ -68,7 +108,16 @@ def load_postman_tools(collection_path: Path) -> list[ApiTool]:
 
     tools: list[ApiTool] = []
     seen_names: dict[str, int] = {}
-    _walk_items(collection.get("item") or [], "", tools, seen_names)
+    collection_variables = _collection_variables(collection.get("variable"))
+    collection_auth = collection.get("auth")
+    _walk_items(
+        collection.get("item") or [],
+        "",
+        tools,
+        seen_names,
+        collection_variables,
+        collection_auth,
+    )
     return tools
 
 
@@ -77,18 +126,37 @@ def _walk_items(
     folder_path: str,
     tools: list[ApiTool],
     seen_names: dict[str, int],
+    collection_variables: dict[str, str],
+    inherited_auth: Any,
 ) -> None:
     for item in items:
         item_name = str(item.get("name") or "").strip()
         request = item.get("request")
         if isinstance(request, dict):
-            tools.append(_parse_request(item_name, folder_path, request, seen_names))
+            tools.append(
+                _parse_request(
+                    item_name,
+                    folder_path,
+                    request,
+                    seen_names,
+                    collection_variables,
+                    request.get("auth", inherited_auth),
+                )
+            )
             continue
 
         nested_path = "/".join(part for part in (folder_path, item_name) if part)
         child_items = item.get("item") or []
         if isinstance(child_items, list):
-            _walk_items(child_items, nested_path, tools, seen_names)
+            child_auth = item.get("auth", inherited_auth)
+            _walk_items(
+                child_items,
+                nested_path,
+                tools,
+                seen_names,
+                collection_variables,
+                child_auth,
+            )
 
 
 def _parse_request(
@@ -96,11 +164,17 @@ def _parse_request(
     folder_path: str,
     request: dict[str, Any],
     seen_names: dict[str, int],
+    collection_variables: dict[str, str],
+    auth: Any,
 ) -> ApiTool:
     raw_url = _raw_url(request.get("url"))
     path = _path_from_url(raw_url)
     base_name = _slug(f"paypal {folder_path} {item_name}")
     tool_name = _unique_name(base_name, seen_names)
+    body_mode, body_template, file_fields, content_types = _body_template(
+        request.get("body")
+    )
+    auth_type, auth_token_variable = _auth_metadata(auth)
     return ApiTool(
         tool_name=tool_name,
         display_name=item_name,
@@ -112,7 +186,70 @@ def _parse_request(
         headers=_headers(request.get("header") or []),
         query_params=_query_params(request.get("url")),
         path_variables=_path_variables(raw_url, path),
-        body_template=_body_template(request.get("body")),
+        collection_variables=collection_variables,
+        auth_type=auth_type,
+        auth_token_variable=auth_token_variable,
+        body_mode=body_mode,
+        body_template=body_template,
+        multipart_file_fields=file_fields,
+        multipart_content_types=content_types,
+    )
+
+
+def _auth_metadata(auth: Any) -> tuple[str | None, str | None]:
+    if not isinstance(auth, dict):
+        return None, None
+    auth_type = auth.get("type")
+    if not isinstance(auth_type, str):
+        return None, None
+    if auth_type != "bearer":
+        return auth_type, None
+
+    bearer = auth.get("bearer")
+    token: Any = bearer.get("token") if isinstance(bearer, dict) else None
+    if isinstance(bearer, list):
+        token_item = next(
+            (
+                item
+                for item in bearer
+                if isinstance(item, dict) and item.get("key") == "token"
+            ),
+            None,
+        )
+        token = token_item.get("value") if isinstance(token_item, dict) else None
+    if not isinstance(token, str):
+        return auth_type, None
+    match = VARIABLE_PATTERN.fullmatch(token)
+    return auth_type, match.group(1) if match else None
+
+
+def _collection_variables(variables: Any) -> dict[str, str]:
+    if not isinstance(variables, list):
+        return {}
+
+    result: dict[str, str] = {}
+    for variable in variables:
+        if (
+            not isinstance(variable, dict)
+            or variable.get("disabled")
+            or variable.get("enabled") is False
+        ):
+            continue
+        key = variable.get("key")
+        value = variable.get("value")
+        if (
+            isinstance(key, str)
+            and value not in (None, "")
+            and not _is_sensitive_variable(key)
+        ):
+            result[key] = str(value)
+    return result
+
+
+def _is_sensitive_variable(name: str) -> bool:
+    normalized_name = name.lower()
+    return normalized_name in SENSITIVE_VARIABLE_NAMES or any(
+        part in normalized_name for part in SENSITIVE_VARIABLE_PARTS
     )
 
 
@@ -186,18 +323,25 @@ def _path_variables(_raw_url: str, path: str) -> tuple[str, ...]:
     return tuple(sorted(variables))
 
 
-def _body_template(body: Any) -> Any:
+def _body_template(
+    body: Any,
+) -> tuple[
+    BodyMode | None,
+    Any,
+    tuple[str, ...],
+    dict[str, str],
+]:
     if not isinstance(body, dict):
-        return None
+        return None, None, (), {}
     mode = body.get("mode")
     if mode == "raw":
         raw_body = body.get("raw")
         if not isinstance(raw_body, str) or not raw_body.strip():
-            return None
+            return "raw", None, (), {}
         try:
-            return json.loads(raw_body)
+            return "raw", json.loads(raw_body), (), {}
         except json.JSONDecodeError:
-            return raw_body
+            return "raw", raw_body, (), {}
     if mode == "urlencoded":
         encoded: dict[str, str] = {}
         for item in body.get("urlencoded") or []:
@@ -207,8 +351,32 @@ def _body_template(body: Any) -> Any:
             value = item.get("value", "")
             if isinstance(key, str):
                 encoded[key] = str(value)
-        return encoded or None
-    return None
+        return "urlencoded", encoded or None, (), {}
+    if mode == "formdata":
+        form_data: dict[str, Any] = {}
+        file_fields: list[str] = []
+        content_types: dict[str, str] = {}
+        for item in body.get("formdata") or []:
+            if not isinstance(item, dict) or item.get("disabled"):
+                continue
+            key = item.get("key")
+            if not isinstance(key, str):
+                continue
+            content_type = item.get("contentType")
+            if isinstance(content_type, str) and content_type:
+                content_types[key] = content_type
+            if item.get("type") == "file":
+                file_fields.append(key)
+                form_data[key] = item.get("src")
+            else:
+                form_data[key] = str(item.get("value", ""))
+        return (
+            "formdata",
+            form_data or None,
+            tuple(file_fields),
+            content_types,
+        )
+    return None, None, (), {}
 
 
 def _slug(value: str) -> str:

@@ -1,12 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
 
 from paypal_agent.config import Settings
+
+_CODEX_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "CODEX_HOME",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+    }
+)
 
 
 class CodexProviderError(RuntimeError):
@@ -27,28 +41,31 @@ def completeWithCodex(
             schemaPath = tempPath / "schema.json"
             schemaPath.write_text(json.dumps(schema), encoding="utf-8")
 
-        command = _codexCommand(settings, outputPath, schemaPath)
+        command: list[str] = _codexCommand(settings, outputPath, schemaPath)
+        environment: dict[str, str] = {
+            name: value
+            for name, value in os.environ.items()
+            if name in _CODEX_ENV_ALLOWLIST
+        }
         try:
-            result = subprocess.run(
+            result: subprocess.CompletedProcess[str] = subprocess.run(
                 command,
                 input=prompt,
                 text=True,
                 capture_output=True,
                 check=False,
                 timeout=settings.codex_timeout_seconds,
+                cwd=tempPath,
+                env=environment,
             )
         except FileNotFoundError as exc:
-            raise CodexProviderError(
-                f"Codex command not found: {settings.codex_command}"
-            ) from exc
+            raise CodexProviderError("Codex command was not found.") from exc
         except subprocess.TimeoutExpired as exc:
             raise CodexProviderError("Codex provider timed out.") from exc
 
         if result.returncode != 0:
-            stderr = result.stderr.strip() or result.stdout.strip()
             raise CodexProviderError(
-                "Codex provider failed. Run `codex login` or `/login codex` "
-                f"and retry. Details: {stderr[:500]}"
+                "Codex provider failed. Run `codex login` or `/login codex` and retry."
             )
         if not outputPath.exists():
             raise CodexProviderError("Codex provider did not write output.")
@@ -64,9 +81,11 @@ def _codexCommand(
         settings.codex_command,
         "exec",
         "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
         "--skip-git-repo-check",
         "--sandbox",
-        settings.codex_sandbox,
+        "read-only",
         "--color",
         "never",
         "--output-last-message",

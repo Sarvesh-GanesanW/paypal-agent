@@ -13,8 +13,7 @@ from paypal_agent.tracing import traceRun
 
 
 class BedrockRuntimeClient(Protocol):
-    def converse(self, **kwargs: Any) -> dict[str, Any]:
-        ...
+    def converse(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
 class BedrockAgentStack:
@@ -36,6 +35,16 @@ class BedrockAgentStack:
     ) -> str:
         if not self.settings.router_enabled:
             return fallback_answer
+        decision = route_result.decision
+        if (
+            route_result.error
+            or decision.intent == "clarify"
+            or decision.missing_inputs
+            or decision.confidence < 0.5
+            or route_payload.get("tool_call_results")
+            or route_payload.get("required_direct_call")
+        ):
+            return fallback_answer
         try:
             subagent_output = await asyncio.to_thread(
                 self._complete,
@@ -48,17 +57,19 @@ class BedrockAgentStack:
                 },
                 1200,
             )
-            return await asyncio.to_thread(
+            answer = await asyncio.to_thread(
                 self._complete,
                 self.settings.main_model_id,
                 ORCHESTRATOR_SYSTEM_PROMPT,
                 {
                     "user_input": user_input,
                     "router_decision": route_result.decision.model_dump(),
+                    "route_payload": route_payload,
                     "subagent_output": subagent_output,
                 },
                 1200,
             )
+            return answer
         except Exception:
             return fallback_answer
 
@@ -112,7 +123,10 @@ class BedrockAgentStack:
             self.settings,
             run_name,
             "llm",
-            inputs={"model_id": model_id, "payload": payload},
+            inputs={
+                "model_id": model_id,
+                "payload": _payload_trace_metadata(payload),
+            },
             metadata={"model_id": model_id, "temperature": 0.0},
             tags=["bedrock", "orchestrator"],
         ) as trace:
@@ -135,7 +149,7 @@ class BedrockAgentStack:
                 inferenceConfig={"maxTokens": max_tokens, "temperature": 0.0},
             )
             text = _text_from_response(response)
-            trace.end({"text": text})
+            trace.end({"text_length": len(text)})
             return text
 
     def _complete_openai(
@@ -156,15 +170,16 @@ class BedrockAgentStack:
             self.settings,
             run_name,
             "llm",
-            inputs={"model_id": model_id, "payload": payload},
+            inputs={
+                "model_id": model_id,
+                "payload": _payload_trace_metadata(payload),
+            },
             metadata={"model_id": model_id, "temperature": 0.0},
             tags=["openai", "orchestrator"],
         ) as trace:
             from openai import OpenAI
 
-            client = OpenAI(
-                api_key=self.settings.openai_api_key.get_secret_value()
-            )
+            client = OpenAI(api_key=self.settings.openai_api_key.get_secret_value())
             response = client.chat.completions.create(
                 model=model_id,
                 messages=[
@@ -180,7 +195,7 @@ class BedrockAgentStack:
             text = response.choices[0].message.content
             if not isinstance(text, str) or not text.strip():
                 raise ValueError("OpenAI response did not include text.")
-            trace.end({"text": text})
+            trace.end({"text_length": len(text)})
             return text.strip()
 
     def _complete_anthropic(
@@ -201,7 +216,10 @@ class BedrockAgentStack:
             self.settings,
             run_name,
             "llm",
-            inputs={"model_id": model_id, "payload": payload},
+            inputs={
+                "model_id": model_id,
+                "payload": _payload_trace_metadata(payload),
+            },
             metadata={"model_id": model_id, "temperature": 0.0},
             tags=["anthropic", "orchestrator"],
         ) as trace:
@@ -223,7 +241,7 @@ class BedrockAgentStack:
                 ],
             )
             text = _text_from_anthropic_response(response)
-            trace.end({"text": text})
+            trace.end({"text_length": len(text)})
             return text
 
     def _complete_codex(
@@ -247,18 +265,21 @@ class BedrockAgentStack:
             self.settings,
             run_name,
             "llm",
-            inputs={"model_id": model_id, "payload": payload},
+            inputs={
+                "model_id": model_id,
+                "payload": _payload_trace_metadata(payload),
+            },
             metadata={
                 "model_id": model_id,
                 "command": self.settings.codex_command,
-                "sandbox": self.settings.codex_sandbox,
+                "sandbox": "read-only",
             },
             tags=["codex", "orchestrator"],
         ) as trace:
             text = completeWithCodex(self.settings, prompt)
             if not text:
                 raise ValueError("Codex response did not include text.")
-            trace.end({"text": text})
+            trace.end({"text_length": len(text)})
             return text
 
     def _client(self) -> BedrockRuntimeClient:
@@ -281,15 +302,37 @@ bodies, emails, invoice numbers, or dates. If values are missing, list them.
 
 ORCHESTRATOR_SYSTEM_PROMPT = """\
 You are the main PayPal orchestrator. Convert the sub-agent output into a concise
-user-facing answer. Keep operational safeguards intact. Do not claim that a
-PayPal request was executed unless a tool result says it was executed.
+user-facing answer using the raw route_payload as the source of truth. Include
+the requested PayPal details, status, errors, and debug ID. Keep operational
+safeguards intact. Do not claim that a PayPal request was executed unless a tool
+result says it was executed.
 """
 
 
-def _text_from_response(response: dict[str, Any]) -> str:
-    content_blocks = (
-        response.get("output", {}).get("message", {}).get("content") or []
+def _payload_trace_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    routePayload = payload.get("route_payload")
+    routePayloadKeys = list(routePayload) if isinstance(routePayload, dict) else []
+    toolResultCount = 0
+    if isinstance(routePayload, dict):
+        toolResults = routePayload.get("tool_call_results")
+        if isinstance(toolResults, list):
+            toolResultCount = len(toolResults)
+    routerDecision = payload.get("router_decision")
+    routerIntent = (
+        routerDecision.get("intent") if isinstance(routerDecision, dict) else None
     )
+    userInput = payload.get("user_input")
+    return {
+        "user_input_length": len(userInput) if isinstance(userInput, str) else 0,
+        "router_intent": routerIntent,
+        "route_payload_keys": routePayloadKeys,
+        "tool_result_count": toolResultCount,
+        "has_subagent_output": "subagent_output" in payload,
+    }
+
+
+def _text_from_response(response: dict[str, Any]) -> str:
+    content_blocks = response.get("output", {}).get("message", {}).get("content") or []
     texts = [
         block["text"]
         for block in content_blocks

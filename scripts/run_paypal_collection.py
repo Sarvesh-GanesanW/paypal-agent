@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from paypal_agent.agent_service import AgentService
 from paypal_agent.config import Settings
 from paypal_agent.paypal_client import ClientInputError, ToolCallInput
@@ -79,6 +81,18 @@ async def _run_tool(
         result = await service.call_tool(tool.tool_name, payload)
     except (ClientInputError, KeyError) as exc:
         return {**_tool_fields(tool), "status": "client_error", "error": str(exc)}
+    except httpx.TimeoutException:
+        return {
+            **_tool_fields(tool),
+            "status": "client_error",
+            "error": "PayPal request timed out.",
+        }
+    except httpx.RequestError:
+        return {
+            **_tool_fields(tool),
+            "status": "client_error",
+            "error": "PayPal request failed.",
+        }
     return {
         **_tool_fields(tool),
         "status": result["status"],

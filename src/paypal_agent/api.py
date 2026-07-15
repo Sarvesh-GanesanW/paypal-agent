@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -31,6 +32,8 @@ async def root() -> dict[str, Any]:
         "model_provider": service.settings.model_provider,
         "router_model": service.settings.router_model_id,
         "main_model": service.settings.main_model_id,
+        "paypal_environment": service.settings.paypal_environment,
+        "paypal_mutations_enabled": service.settings.paypal_allow_mutations,
         "langsmith_tracing": service.settings.langsmith_tracing
         and service.settings.langsmith_api_key is not None,
     }
@@ -67,6 +70,16 @@ async def call_tool(tool_name: str, payload: ToolCallInput) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ClientInputError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="PayPal request timed out.",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="PayPal request failed.",
+        ) from exc
 
 
 @app.get("/rag/search")
@@ -108,6 +121,8 @@ async def observability() -> dict[str, Any]:
         "model_provider": service.settings.model_provider,
         "router_model": service.settings.router_model_id,
         "main_model": service.settings.main_model_id,
+        "paypal_environment": service.settings.paypal_environment,
+        "paypal_mutations_enabled": service.settings.paypal_allow_mutations,
         "orchestrator": "langgraph_state_graph",
     }
 

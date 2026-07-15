@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
 
@@ -29,20 +30,20 @@ SUPPORT_TOOL_NAMES = {
 }
 MEMORY_GREP_TERMS = {"grep"}
 MEMORY_FIND_TERMS = {"memory", "memories", "remember", "recall"}
-SYSTEM_TERMS = {
-    "available",
-    "capabilities",
-    "capability",
-    "history",
-    "last",
-    "log",
-    "logs",
-    "recent",
-    "request",
-    "requests",
-    "status",
-    "tool",
-    "tools",
+SYSTEM_TERMS = {"capabilities", "capability", "log", "logs", "tool", "tools"}
+SYSTEM_PHRASES = {
+    "available capabilities",
+    "available tools",
+    "last request",
+    "last requests",
+    "recent request",
+    "recent requests",
+    "request history",
+    "request log",
+    "request logs",
+    "system log",
+    "system logs",
+    "system status",
 }
 RAG_TERMS = {
     "architecture",
@@ -56,18 +57,87 @@ RAG_TERMS = {
     "knowledge",
     "why",
 }
+TOOL_TERM_ALIASES = {
+    "fetch": "show",
+    "get": "show",
+    "last": "list",
+    "latest": "list",
+    "recent": "list",
+    "retrieve": "show",
+}
+TOOL_TERM_STOP_WORDS = {
+    "a",
+    "all",
+    "an",
+    "and",
+    "detail",
+    "details",
+    "for",
+    "information",
+    "of",
+    "the",
+}
+IDENTIFIER_SKIP_WORDS = {
+    "called",
+    "detail",
+    "details",
+    "id",
+    "is",
+    "named",
+    "number",
+    "please",
+    "request",
+    "with",
+}
+REQUIRED_DATE_QUERY_PARAMS = {
+    "/v1/billing/subscriptions/{subscription_id}/transactions": (
+        "start_time",
+        "end_time",
+    ),
+    "/v1/reporting/transactions": ("start_date", "end_date"),
+}
+FIXED_QUERY_PARAMETER_NAMES = {"schema"}
+SERVER_QUERY_PARAMETERS = {
+    "/v1/reporting/transactions": {"page", "page_size"},
+}
+SERVER_QUERY_DEFAULTS = {
+    "/v1/reporting/transactions": {"page_size": 100},
+}
+PROTECTED_HEADER_NAMES = {
+    "authorization",
+    "content-length",
+    "content-type",
+    "host",
+    "paypal-auth-assertion",
+    "proxy-authorization",
+}
+DATE_PATTERN = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}"
+    r"(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?\b"
+)
+WORD_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+VARIABLE_PATTERN = re.compile(r"\{\{([^{}]+)\}\}")
 
 
 class BedrockRuntimeClient(Protocol):
-    def converse(self, **kwargs: Any) -> dict[str, Any]:
-        ...
+    def converse(self, **kwargs: Any) -> dict[str, Any]: ...
+
+
+class RoutedToolInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    path_params: dict[str, Any] = Field(default_factory=dict, alias="pathParams")
+    query: dict[str, Any] = Field(default_factory=dict)
+    body: Any = None
+    headers: dict[str, str] = Field(default_factory=dict)
 
 
 class RouterDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     intent: RouterIntent
-    selected_tool_names: list[str] = Field(max_length=12)
+    selected_tool_names: list[str] = Field(max_length=1)
+    tool_input: RoutedToolInput | None = None
     missing_inputs: list[str] = Field(max_length=12)
     user_message: str
     confidence: float = Field(ge=0, le=1)
@@ -99,22 +169,31 @@ class SmallModelRouter:
         user_input: str,
         candidates: list[ApiTool],
     ) -> RouteResult:
-        fallback = _fallback_decision(user_input, candidates)
+        routableCandidates: list[ApiTool] = [
+            tool for tool in candidates if tool.unsupported_reason is None
+        ]
         if not self.settings.router_enabled:
-            return RouteResult(decision=fallback, mode="deterministic")
+            return RouteResult(
+                decision=_fallback_decision(user_input, routableCandidates),
+                mode="deterministic",
+            )
 
         try:
             decision = await asyncio.wait_for(
-                asyncio.to_thread(self._route_with_provider, user_input, candidates),
+                asyncio.to_thread(
+                    self._route_with_provider,
+                    user_input,
+                    routableCandidates,
+                ),
                 timeout=self.settings.router_timeout_seconds,
             )
-            _validate_tool_names(decision, candidates)
-        except Exception as exc:
+            _validate_decision(decision, routableCandidates, user_input)
+        except Exception:
             provider = self.settings.model_provider
             return RouteResult(
-                decision=fallback,
+                decision=_provider_error_decision(),
                 mode=f"deterministic_after_{provider}_error",
-                error=str(exc),
+                error="Model router unavailable.",
             )
         return RouteResult(
             decision=decision,
@@ -146,10 +225,8 @@ class SmallModelRouter:
             "llm",
             inputs={
                 "model_id": self.settings.bedrock_router_model_id,
-                "user_input": user_input,
-                "candidate_tool_names": [
-                    tool.tool_name for tool in candidates
-                ],
+                "user_input_length": len(user_input),
+                "candidate_tool_names": [tool.tool_name for tool in candidates],
             },
             metadata={
                 "model_id": self.settings.bedrock_router_model_id,
@@ -174,7 +251,7 @@ class SmallModelRouter:
                 inferenceConfig={"maxTokens": 512, "temperature": 0.0},
             )
             decision = RouterDecision.model_validate(_tool_use_input(response))
-            trace.end({"decision": decision.model_dump()})
+            trace.end(_decision_trace_metadata(decision))
             return decision
 
     def _route_with_openai(
@@ -191,10 +268,8 @@ class SmallModelRouter:
             "llm",
             inputs={
                 "model_id": self.settings.openai_router_model_id,
-                "user_input": user_input,
-                "candidate_tool_names": [
-                    tool.tool_name for tool in candidates
-                ],
+                "user_input_length": len(user_input),
+                "candidate_tool_names": [tool.tool_name for tool in candidates],
             },
             metadata={
                 "model_id": self.settings.openai_router_model_id,
@@ -205,9 +280,7 @@ class SmallModelRouter:
         ) as trace:
             from openai import OpenAI
 
-            client = OpenAI(
-                api_key=self.settings.openai_api_key.get_secret_value()
-            )
+            client = OpenAI(api_key=self.settings.openai_api_key.get_secret_value())
             response = client.chat.completions.create(
                 model=self.settings.openai_router_model_id,
                 messages=[
@@ -221,7 +294,7 @@ class SmallModelRouter:
             if not isinstance(content, str):
                 raise RouterModelError("OpenAI router returned empty content.")
             decision = RouterDecision.model_validate_json(content)
-            trace.end({"decision": decision.model_dump()})
+            trace.end(_decision_trace_metadata(decision))
             return decision
 
     def _route_with_anthropic(
@@ -240,10 +313,8 @@ class SmallModelRouter:
             "llm",
             inputs={
                 "model_id": self.settings.anthropic_router_model_id,
-                "user_input": user_input,
-                "candidate_tool_names": [
-                    tool.tool_name for tool in candidates
-                ],
+                "user_input_length": len(user_input),
+                "candidate_tool_names": [tool.tool_name for tool in candidates],
             },
             metadata={
                 "model_id": self.settings.anthropic_router_model_id,
@@ -266,10 +337,8 @@ class SmallModelRouter:
                 tools=cast(Any, [_anthropicRouterToolSpec()]),
                 tool_choice=cast(Any, {"type": "tool", "name": "route_request"}),
             )
-            decision = RouterDecision.model_validate(
-                _anthropicToolUseInput(response)
-            )
-            trace.end({"decision": decision.model_dump()})
+            decision = RouterDecision.model_validate(_anthropicToolUseInput(response))
+            trace.end(_decision_trace_metadata(decision))
             return decision
 
     def _route_with_codex(
@@ -290,10 +359,8 @@ class SmallModelRouter:
             "llm",
             inputs={
                 "model_id": self.settings.router_model_id,
-                "user_input": user_input,
-                "candidate_tool_names": [
-                    tool.tool_name for tool in candidates
-                ],
+                "user_input_length": len(user_input),
+                "candidate_tool_names": [tool.tool_name for tool in candidates],
             },
             metadata={
                 "model_id": self.settings.router_model_id,
@@ -307,10 +374,8 @@ class SmallModelRouter:
                 prompt,
                 schema=RouterDecision.model_json_schema(),
             )
-            decision = RouterDecision.model_validate_json(
-                _jsonTextFromCodex(text)
-            )
-            trace.end({"decision": decision.model_dump()})
+            decision = RouterDecision.model_validate_json(_jsonTextFromCodex(text))
+            trace.end(_decision_trace_metadata(decision))
             return decision
 
     def _client(self) -> BedrockRuntimeClient:
@@ -329,10 +394,13 @@ ROUTER_SYSTEM_PROMPT = """\
 You are the routing sub-agent for a PayPal API orchestrator.
 
 You receive a user request and a shortlisted set of PayPal tools. Pick only from
-that shortlist or from the support tools. Never invent a tool name. If required
+that shortlist or from the support tools. Never invent a tool name and never
+select more than one. For a PayPal tool, copy every user-provided path, query,
+header, and body value into tool_input. Copy only values explicitly marked as
+fixed from tool metadata; other metadata values are not defaults. If required
 IDs, dates, emails, amounts, or request body values are missing, list them in
-missing_inputs. Mutating actions may be selected, but execution is handled by a
-separate confirmation gate.
+missing_inputs. Never set confirm=true. Mutating actions may be selected, but
+chat only prepares them for a separate confirmation gate.
 
 Return only through the route_request tool.
 """
@@ -404,19 +472,31 @@ def _router_payload(user_input: str, candidates: list[ApiTool]) -> str:
                 "folder_path": tool.folder_path,
                 "method": tool.method,
                 "path": tool.path,
-                "path_variables": list(tool.path_variables),
+                "path_parameters": list(tool.path_variables),
+                "query_parameters": list(tool.query_params),
+                "required_query_parameters": _required_query_parameters(tool),
+                "fixed_query_parameters": _fixed_query_parameters(tool),
+                "server_query_parameters": sorted(
+                    SERVER_QUERY_PARAMETERS.get(tool.path, set())
+                ),
+                "header_parameters": [
+                    name
+                    for name in tool.headers
+                    if name.lower() not in PROTECTED_HEADER_NAMES
+                ],
+                "body_fields": _body_fields(tool.body_template),
+                "has_body": tool.body_template is not None,
                 "is_mutating": tool.is_mutating,
             }
             for tool in candidates
+            if tool.unsupported_reason is None
         ],
     }
     return json.dumps(payload, separators=(",", ":"))
 
 
 def _tool_use_input(response: dict[str, Any]) -> dict[str, Any]:
-    content_blocks = (
-        response.get("output", {}).get("message", {}).get("content") or []
-    )
+    content_blocks = response.get("output", {}).get("message", {}).get("content") or []
     for block in content_blocks:
         tool_use = block.get("toolUse") if isinstance(block, dict) else None
         if isinstance(tool_use, dict) and tool_use.get("name") == "route_request":
@@ -452,7 +532,11 @@ def _jsonTextFromCodex(text: str) -> str:
     raise RouterModelError("Codex router did not return JSON.")
 
 
-def _validate_tool_names(decision: RouterDecision, candidates: list[ApiTool]) -> None:
+def _validate_decision(
+    decision: RouterDecision,
+    candidates: list[ApiTool],
+    user_input: str,
+) -> None:
     allowed_names = {tool.tool_name for tool in candidates} | SUPPORT_TOOL_NAMES
     invalid_names = [
         tool_name
@@ -463,6 +547,43 @@ def _validate_tool_names(decision: RouterDecision, candidates: list[ApiTool]) ->
         raise RouterModelError(
             "Router selected invalid tools: " + ", ".join(invalid_names)
         )
+    if decision.intent in SUPPORT_TOOL_NAMES:
+        if decision.selected_tool_names != [decision.intent]:
+            raise RouterModelError("Router intent and support tool do not match.")
+        if decision.tool_input is not None:
+            raise RouterModelError("Support tools cannot include PayPal input.")
+        return
+    if decision.intent == "clarify":
+        if decision.selected_tool_names or decision.tool_input is not None:
+            raise RouterModelError("Clarification cannot select a PayPal tool.")
+        return
+    if decision.intent != "paypal_tool":
+        raise RouterModelError("Router returned an unsupported intent.")
+    if len(decision.selected_tool_names) != 1:
+        raise RouterModelError("Router must select exactly one PayPal tool.")
+    if decision.selected_tool_names[0] in SUPPORT_TOOL_NAMES:
+        raise RouterModelError("PayPal intent cannot select a support tool.")
+
+    tool_by_name = {tool.tool_name: tool for tool in candidates}
+    tool = tool_by_name[decision.selected_tool_names[0]]
+    bound_query, missing_query_inputs = _bound_query_parameters(user_input, tool)
+    if decision.tool_input is not None:
+        for name, value in bound_query.items():
+            decision.tool_input.query.setdefault(name, value)
+    decision.missing_inputs = list(
+        dict.fromkeys([*decision.missing_inputs, *missing_query_inputs])
+    )
+    if decision.missing_inputs:
+        return
+    if decision.tool_input is None:
+        raise RouterModelError("Router did not provide PayPal tool_input.")
+
+    if tool.is_mutating and tool.body_template is not None:
+        if decision.tool_input.body is None:
+            raise RouterModelError(
+                "Router did not provide the exact mutating request body."
+            )
+    _validate_tool_input(tool, decision.tool_input, user_input)
 
 
 def _fallback_decision(user_input: str, candidates: list[ApiTool]) -> RouterDecision:
@@ -483,7 +604,7 @@ def _fallback_decision(user_input: str, candidates: list[ApiTool]) -> RouterDeci
             user_message="Finding matching local memory entries.",
             confidence=0.85,
         )
-    if terms & SYSTEM_TERMS:
+    if _is_system_search(user_input, terms):
         return RouterDecision(
             intent="system_search",
             selected_tool_names=["system_search"],
@@ -499,15 +620,323 @@ def _fallback_decision(user_input: str, candidates: list[ApiTool]) -> RouterDeci
             user_message="Searching the local knowledge base.",
             confidence=0.8,
         )
-    selected_tool_names = [tool.tool_name for tool in candidates]
-    return RouterDecision(
-        intent="paypal_tool" if selected_tool_names else "clarify",
-        selected_tool_names=selected_tool_names,
-        missing_inputs=[] if selected_tool_names else ["more specific request"],
-        user_message=(
-            "Selected the most relevant PayPal tools."
-            if selected_tool_names
-            else "Please provide the PayPal action you want to perform."
-        ),
-        confidence=0.65 if selected_tool_names else 0.3,
+    selected_tool = _deterministic_tool(user_input, candidates)
+    if selected_tool is None:
+        return RouterDecision(
+            intent="clarify",
+            selected_tool_names=[],
+            missing_inputs=["one unambiguous PayPal action"],
+            user_message=(
+                "Please specify one PayPal action and include its required "
+                "IDs, dates, and filters."
+            ),
+            confidence=0.3,
+        )
+
+    tool_input, missing_inputs = _deterministic_tool_input(
+        user_input,
+        selected_tool,
     )
+    return RouterDecision(
+        intent="paypal_tool",
+        selected_tool_names=[selected_tool.tool_name],
+        tool_input=tool_input,
+        missing_inputs=missing_inputs,
+        user_message=(
+            "I need " + ", ".join(missing_inputs) + " before calling PayPal."
+            if missing_inputs
+            else "Selected the exact PayPal tool and request values."
+        ),
+        confidence=0.8 if not missing_inputs else 0.6,
+    )
+
+
+def _provider_error_decision() -> RouterDecision:
+    return RouterDecision(
+        intent="clarify",
+        selected_tool_names=[],
+        missing_inputs=["a verified PayPal tool selection"],
+        user_message=(
+            "I could not safely verify one exact PayPal request. Please restate "
+            "the action with its required IDs, dates, and filters."
+        ),
+        confidence=0.0,
+    )
+
+
+def _decision_trace_metadata(decision: RouterDecision) -> dict[str, Any]:
+    return {
+        "intent": decision.intent,
+        "selected_tool_names": decision.selected_tool_names,
+        "missing_input_names": decision.missing_inputs,
+        "has_tool_input": decision.tool_input is not None,
+        "confidence": decision.confidence,
+    }
+
+
+def _body_fields(body_template: Any) -> list[str]:
+    if not isinstance(body_template, dict):
+        return []
+    return [str(name) for name in body_template]
+
+
+def _required_query_parameters(tool: ApiTool) -> list[str]:
+    parameters = [
+        name
+        for name, value in tool.query_params.items()
+        if VARIABLE_PATTERN.fullmatch(value)
+    ]
+    for name in REQUIRED_DATE_QUERY_PARAMS.get(tool.path, ()):
+        if name not in parameters:
+            parameters.append(name)
+    return parameters
+
+
+def _fixed_query_parameters(tool: ApiTool) -> dict[str, str]:
+    return {
+        name: value
+        for name, value in tool.query_params.items()
+        if name in FIXED_QUERY_PARAMETER_NAMES
+        and value
+        and not VARIABLE_PATTERN.fullmatch(value)
+    }
+
+
+def _is_system_search(user_input: str, terms: set[str]) -> bool:
+    normalized_input = " ".join(
+        match.group(0).lower() for match in WORD_PATTERN.finditer(user_input)
+    )
+    return bool(terms & SYSTEM_TERMS) or any(
+        phrase in normalized_input for phrase in SYSTEM_PHRASES
+    )
+
+
+def _deterministic_tool(
+    user_input: str,
+    candidates: list[ApiTool],
+) -> ApiTool | None:
+    user_terms = _tool_terms(user_input)
+    matches: list[tuple[int, ApiTool]] = []
+    for tool in candidates:
+        if tool.unsupported_reason is not None:
+            continue
+        display_terms = _tool_terms(tool.display_name)
+        if display_terms and display_terms <= user_terms:
+            matches.append((len(display_terms), tool))
+    if not matches:
+        return None
+
+    best_score = max(score for score, _tool in matches)
+    best_tools = [tool for score, tool in matches if score == best_score]
+    if len(best_tools) != 1:
+        return None
+    return best_tools[0]
+
+
+def _tool_terms(value: str) -> set[str]:
+    terms: set[str] = set()
+    for match in WORD_PATTERN.finditer(value.lower()):
+        term = match.group(0).strip("._-")
+        if term.endswith("s") and len(term) > 3:
+            term = term[:-1]
+        term = TOOL_TERM_ALIASES.get(term, term)
+        if len(term) > 1 and term not in TOOL_TERM_STOP_WORDS:
+            terms.add(term)
+    return terms
+
+
+def _deterministic_tool_input(
+    user_input: str,
+    tool: ApiTool,
+) -> tuple[RoutedToolInput, list[str]]:
+    path_params: dict[str, Any] = {}
+    missing_inputs: list[str] = []
+    for parameter_name in tool.path_variables:
+        value = _identifier_parameter_value(user_input, parameter_name)
+        if value is None:
+            missing_inputs.append(parameter_name)
+        else:
+            path_params[parameter_name] = value
+
+    query, missing_query_inputs = _bound_query_parameters(user_input, tool)
+    missing_inputs.extend(missing_query_inputs)
+    if tool.is_mutating and tool.body_template is not None:
+        missing_inputs.append("request body")
+
+    return RoutedToolInput(pathParams=path_params, query=query), missing_inputs
+
+
+def _bound_query_parameters(
+    user_input: str,
+    tool: ApiTool,
+) -> tuple[dict[str, Any], list[str]]:
+    query: dict[str, Any] = dict(_fixed_query_parameters(tool))
+    missing_inputs: list[str] = []
+    for parameter_name, template_value in tool.query_params.items():
+        if not VARIABLE_PATTERN.fullmatch(template_value):
+            continue
+        value = _identifier_parameter_value(user_input, parameter_name)
+        if value is None:
+            missing_inputs.append(parameter_name)
+        else:
+            query[parameter_name] = value
+
+    date_parameters = REQUIRED_DATE_QUERY_PARAMS.get(tool.path, ())
+    dates = DATE_PATTERN.findall(user_input)
+    for index, parameter_name in enumerate(date_parameters):
+        if index >= len(dates):
+            missing_inputs.append(parameter_name)
+        else:
+            query[parameter_name] = _rfc3339_date(
+                dates[index],
+                is_end=parameter_name.startswith("end_"),
+            )
+    query.update(SERVER_QUERY_DEFAULTS.get(tool.path, {}))
+
+    return query, missing_inputs
+
+
+def _rfc3339_date(value: str, *, is_end: bool) -> str:
+    if len(value) != 10:
+        return value
+    time = "23:59:59Z" if is_end else "00:00:00Z"
+    return f"{value}T{time}"
+
+
+def _identifier_parameter_value(
+    user_input: str,
+    parameter_name: str,
+) -> str | None:
+    entity_name = parameter_name.removesuffix("_id").replace("_", " ")
+    explicit_name = parameter_name.replace("_", " ")
+    if explicit_name != entity_name:
+        value = _value_after_label(
+            user_input,
+            explicit_name,
+            require_identifier_shape=False,
+        )
+        if value is not None:
+            return value
+    return _value_after_label(
+        user_input,
+        entity_name,
+        require_identifier_shape=True,
+    )
+
+
+def _value_after_label(
+    user_input: str,
+    label: str,
+    *,
+    require_identifier_shape: bool,
+) -> str | None:
+    label_pattern = r"\s+".join(re.escape(part) for part in label.split())
+    entity_pattern = re.compile(rf"\b{label_pattern}\b", re.IGNORECASE)
+    for match in entity_pattern.finditer(user_input):
+        remainder = user_input[match.end() : match.end() + 100]
+        for token_match in WORD_PATTERN.finditer(remainder):
+            token = token_match.group(0).strip("._-")
+            if token.lower() in IDENTIFIER_SKIP_WORDS:
+                continue
+            if (
+                not require_identifier_shape
+                or any(character.isdigit() for character in token)
+                or (len(token) >= 6 and token.isupper())
+            ):
+                return token_match.group(0).strip(".,;:!?'\"")
+            break
+    return None
+
+
+def _validate_tool_input(
+    tool: ApiTool,
+    tool_input: RoutedToolInput,
+    user_input: str,
+) -> None:
+    if set(tool_input.path_params) != set(tool.path_variables):
+        raise RouterModelError("Router did not provide the exact path parameters.")
+    if not tool.is_mutating and tool_input.body is not None:
+        raise RouterModelError("Read-only PayPal tools cannot include a body.")
+    if PROTECTED_HEADER_NAMES & {name.lower() for name in tool_input.headers}:
+        raise RouterModelError("Router supplied a protected authentication header.")
+
+    allowed_query_names = set(tool.query_params) | SERVER_QUERY_PARAMETERS.get(
+        tool.path,
+        set(),
+    )
+    unknown_query_names = set(tool_input.query) - allowed_query_names
+    if unknown_query_names:
+        raise RouterModelError(
+            "Router supplied unsupported query parameters: "
+            + ", ".join(sorted(unknown_query_names))
+        )
+    missing_query_names = set(_required_query_parameters(tool)) - set(tool_input.query)
+    if missing_query_names:
+        raise RouterModelError(
+            "Router did not provide required query parameters: "
+            + ", ".join(sorted(missing_query_names))
+        )
+
+    for value in tool_input.path_params.values():
+        if not _is_grounded_value(value, user_input):
+            raise RouterModelError(
+                "Router supplied a request value that was not in the user input."
+            )
+    fixed_query = _fixed_query_parameters(tool)
+    server_defaults = SERVER_QUERY_DEFAULTS.get(tool.path, {})
+    for name, value in tool_input.query.items():
+        if name in fixed_query:
+            if str(value) != fixed_query[name]:
+                raise RouterModelError(f"Router changed fixed query parameter: {name}")
+            continue
+        if name in server_defaults and str(value) == str(server_defaults[name]):
+            continue
+        isGrounded = _is_grounded_value(value, user_input)
+        if name in {"start_date", "end_date", "start_time", "end_time"}:
+            isGrounded = isGrounded or (
+                isinstance(value, str) and _is_grounded_value(value[:10], user_input)
+            )
+        if not isGrounded:
+            raise RouterModelError(
+                "Router supplied a request value that was not in the user input."
+            )
+    for value in tool_input.headers.values():
+        if not _is_grounded_value(value, user_input):
+            raise RouterModelError(
+                "Router supplied a request value that was not in the user input."
+            )
+    for value in _scalar_values(tool_input.body):
+        if not _is_grounded_value(value, user_input):
+            raise RouterModelError(
+                "Router supplied a body value that was not in the user input."
+            )
+
+
+def _is_grounded_value(value: Any, user_input: str) -> bool:
+    if not isinstance(value, str | int | float):
+        return False
+    text_value = str(value).strip()
+    if not text_value:
+        return False
+    value_pattern = re.compile(
+        rf"(?<![A-Za-z0-9._-]){re.escape(text_value)}"
+        r"(?![A-Za-z0-9._-])",
+        re.IGNORECASE,
+    )
+    return value_pattern.search(user_input) is not None
+
+
+def _scalar_values(value: Any) -> list[str | int | float]:
+    if isinstance(value, dict):
+        values: list[str | int | float] = []
+        for child in value.values():
+            values.extend(_scalar_values(child))
+        return values
+    if isinstance(value, list):
+        values = []
+        for child in value:
+            values.extend(_scalar_values(child))
+        return values
+    if isinstance(value, str | int | float):
+        return [value]
+    return []

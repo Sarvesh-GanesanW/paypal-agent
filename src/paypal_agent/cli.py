@@ -293,6 +293,9 @@ def formatRouteSummary(result: dict[str, Any], *, no_color: bool = False) -> str
             + f" status={toolResult.get('status')}"
             + f" status_code={toolResult.get('status_code')}"
         )
+        paypalDebugId = toolResult.get("paypal_debug_id")
+        if paypalDebugId:
+            lines.append("paypal_debug_id=" + str(paypalDebugId))
     if metadata.get("router_error"):
         lines.append("router_error=" + str(metadata["router_error"]))
     return "\n".join(lines)
