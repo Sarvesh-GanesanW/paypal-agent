@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from pathlib import Path
@@ -143,6 +144,584 @@ async def test_chat_missing_order_id_makes_no_request(
     assert requests == []
     assert result["router_decision"]["missing_inputs"] == ["order_id"]
     assert "order_id" in result["answer"]
+
+
+@pytest.mark.asyncio
+async def test_chat_missing_input_does_not_echo_provider_message(
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routeResult: RouteResult = RouteResult(
+        decision=RouterDecision(
+            intent="paypal_tool",
+            selected_tool_names=["paypal_orders_show_order_details"],
+            tool_input=RoutedToolInput(pathParams={}),
+            missing_inputs=["order_id"],
+            user_message="Show order details",
+            confidence=0.95,
+        ),
+        mode="bedrock",
+    )
+    service = AgentService(test_settings)
+    monkeypatch.setattr(
+        service.router,
+        "route",
+        AsyncMock(return_value=routeResult),
+    )
+
+    result = await service.chat("Show order details", "echo-thread")
+
+    assert result["answer"] == "I need order_id before calling PayPal."
+
+
+@pytest.mark.asyncio
+async def test_chat_uses_pending_request_for_follow_up_id(
+    test_settings: Settings,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "TEST-ORDER-123"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+        firstResult = await service.chat(
+            "Show order details",
+            "follow-up-thread",
+        )
+        secondResult = await service.chat(
+            "The order ID is TEST-ORDER-123",
+            "follow-up-thread",
+        )
+
+    assert firstResult["router_decision"]["missing_inputs"] == ["order_id"]
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert requests[0].url.path == "/v2/checkout/orders/TEST-ORDER-123"
+    assert secondResult["selected_tool_names"] == ["paypal_orders_show_order_details"]
+
+
+@pytest.mark.parametrize(
+    "followUp",
+    [
+        "I can provide the order ID: TEST-ORDER-123",
+        "Confirm the order ID is TEST-ORDER-123",
+        "Add order ID TEST-ORDER-123",
+    ],
+)
+@pytest.mark.asyncio
+async def test_follow_up_verbs_do_not_clear_pending_request(
+    test_settings: Settings,
+    followUp: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "TEST-ORDER-123"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+        await service.chat("Show order details", "verb-follow-up")
+        result = await service.chat(followUp, "verb-follow-up")
+
+    assert len(requests) == 1
+    assert requests[0].url.path == "/v2/checkout/orders/TEST-ORDER-123"
+    assert result["selected_tool_names"] == ["paypal_orders_show_order_details"]
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_uses_pending_request_for_follow_up_id(
+    test_settings: Settings,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "STREAM-ORDER-123"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+        firstEvents = [
+            event
+            async for event in service.stream_chat(
+                "Show order details",
+                "stream-follow-up",
+            )
+        ]
+        secondEvents = [
+            event
+            async for event in service.stream_chat(
+                "The order ID is STREAM-ORDER-123",
+                "stream-follow-up",
+            )
+        ]
+
+    firstResult = firstEvents[-1].get("result")
+    secondResult = secondEvents[-1].get("result")
+    assert isinstance(firstResult, dict)
+    assert isinstance(secondResult, dict)
+    assert firstResult["router_decision"]["missing_inputs"] == ["order_id"]
+    assert len(requests) == 1
+    assert requests[0].url.path == "/v2/checkout/orders/STREAM-ORDER-123"
+    assert secondResult["tool_results"][0]["status_code"] == 200
+
+
+@pytest.mark.asyncio
+async def test_pending_request_is_isolated_by_conversation(
+    test_settings: Settings,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+        await service.chat("Show order details", "conversation-a")
+        result = await service.chat(
+            "The order ID is TEST-ORDER-123",
+            "conversation-b",
+        )
+
+    assert requests == []
+    assert result["router_decision"]["intent"] == "clarify"
+
+
+@pytest.mark.asyncio
+async def test_explicit_new_action_replaces_pending_request(
+    test_settings: Settings,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"products": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+        await service.chat("Show order details", "switch-thread")
+        result = await service.chat("List PayPal products", "switch-thread")
+
+    assert len(requests) == 1
+    assert requests[0].url.path == "/v1/catalogs/products"
+    assert result["selected_tool_names"] == [
+        "paypal_subscriptions_catalog_products_list_products"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_new_incomplete_action_replaces_pending_request(
+    test_settings: Settings,
+) -> None:
+    service = AgentService(test_settings)
+
+    await service.chat("Show order details", "switch-missing-thread")
+    result = await service.chat(
+        "Actually show product details",
+        "switch-missing-thread",
+    )
+
+    assert result["selected_tool_names"] == [
+        "paypal_subscriptions_catalog_products_show_product_details"
+    ]
+    assert result["router_decision"]["missing_inputs"] == ["product_id"]
+    assert service.pending_requests["switch-missing-thread"][1] == (
+        "paypal_subscriptions_catalog_products_show_product_details"
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_conversation_requests_are_serialized(
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    firstStarted: asyncio.Event = asyncio.Event()
+    releaseFirst: asyncio.Event = asyncio.Event()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"products": []})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+
+        async def routeRequest(
+            userInput: str,
+            _candidates: list[Any],
+        ) -> RouteResult:
+            if userInput == "Show order details":
+                firstStarted.set()
+                await releaseFirst.wait()
+                return RouteResult(
+                    decision=RouterDecision(
+                        intent="paypal_tool",
+                        selected_tool_names=[
+                            "paypal_orders_show_order_details"
+                        ],
+                        tool_input=RoutedToolInput(),
+                        missing_inputs=["order_id"],
+                        user_message="Missing order ID.",
+                        confidence=0.9,
+                    ),
+                    mode="test",
+                )
+            return RouteResult(
+                decision=RouterDecision(
+                    intent="paypal_tool",
+                    selected_tool_names=[
+                        "paypal_subscriptions_catalog_products_list_products"
+                    ],
+                    tool_input=RoutedToolInput(),
+                    missing_inputs=[],
+                    user_message="Listing products.",
+                    confidence=0.9,
+                ),
+                mode="test",
+            )
+
+        monkeypatch.setattr(service.router, "route", routeRequest)
+        firstTask: asyncio.Task[dict[str, Any]] = asyncio.create_task(
+            service.chat("Show order details", "serialized-thread")
+        )
+        await firstStarted.wait()
+        secondTask: asyncio.Task[dict[str, Any]] = asyncio.create_task(
+            service.chat("List PayPal products", "serialized-thread")
+        )
+        await asyncio.sleep(0)
+        releaseFirst.set()
+        firstResult, secondResult = await asyncio.gather(
+            firstTask,
+            secondTask,
+        )
+
+    assert firstResult["router_decision"]["missing_inputs"] == ["order_id"]
+    assert secondResult["selected_tool_names"] == [
+        "paypal_subscriptions_catalog_products_list_products"
+    ]
+    assert "serialized-thread" not in service.pending_requests
+
+
+@pytest.mark.asyncio
+async def test_expired_pending_request_is_not_reused(
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    currentTime: float = 100.0
+    monkeypatch.setattr(
+        "paypal_agent.agent_service.time.monotonic",
+        lambda: currentTime,
+    )
+    service = AgentService(test_settings)
+
+    await service.chat("Show order details", "expiry-thread")
+    currentTime = 1_001.0
+    result = await service.chat(
+        "The order ID is PRIVATE-ORDER-123",
+        "expiry-thread",
+    )
+
+    assert result["router_decision"]["intent"] == "clarify"
+    assert "expiry-thread" not in service.pending_requests
+
+
+@pytest.mark.asyncio
+async def test_expired_pending_requests_are_swept_by_other_conversations(
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    currentTime: float = 100.0
+    monkeypatch.setattr(
+        "paypal_agent.agent_service.time.monotonic",
+        lambda: currentTime,
+    )
+    service = AgentService(test_settings)
+
+    await service.chat("Show order details", "expired-conversation")
+    currentTime = 1_001.0
+    await service.chat("Show product details", "active-conversation")
+
+    assert "expired-conversation" not in service.pending_requests
+    assert "active-conversation" in service.pending_requests
+
+
+@pytest.mark.asyncio
+async def test_chat_rejects_unbounded_input_and_conversation_id(
+    test_settings: Settings,
+) -> None:
+    service = AgentService(test_settings)
+
+    with pytest.raises(ValueError, match="user_input"):
+        await service.chat("x" * 8_193, "bounded-thread")
+    with pytest.raises(ValueError, match="conversation_id"):
+        await service.chat("Show order details", "x" * 129)
+
+
+@pytest.mark.asyncio
+async def test_missing_mutation_body_is_not_duplicated(
+    test_settings: Settings,
+) -> None:
+    service = AgentService(test_settings)
+
+    result = await service.chat("Create order for 50 USD", "body-thread")
+
+    assert result["router_decision"]["missing_inputs"] == ["request body"]
+    assert result["answer"].count("exact non-empty request body") == 1
+
+
+@pytest.mark.asyncio
+async def test_sales_volume_paginates_and_aggregates_by_currency(
+    test_settings: Settings,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def transaction(
+        eventCode: str,
+        status: str,
+        currency: str,
+        value: str,
+    ) -> dict[str, Any]:
+        return {
+            "transaction_info": {
+                "transaction_event_code": eventCode,
+                "transaction_status": status,
+                "transaction_amount": {
+                    "currency_code": currency,
+                    "value": value,
+                },
+            }
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        pageNumber: int = int(request.url.params["page"])
+        details: list[dict[str, Any]]
+        if pageNumber == 1:
+            details = [
+                transaction("T0005", "S", "USD", "100.00"),
+                transaction("T1107", "S", "USD", "-10.00"),
+                transaction("T0005", "P", "USD", "40.00"),
+            ]
+        else:
+            details = [
+                transaction("T0007", "S", "USD", "50.00"),
+                transaction("T0005", "S", "EUR", "20.00"),
+            ]
+        return httpx.Response(
+            200,
+            headers={"PayPal-Debug-Id": f"debug-page-{pageNumber}"},
+            json={
+                "transaction_details": details,
+                "page": pageNumber,
+                "total_items": 5,
+                "total_pages": 2,
+                "last_refreshed_datetime": "2026-07-01T03:00:00Z",
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+        result = await service.chat(
+            "What was my total PayPal sales volume last month?",
+            "sales-volume-thread",
+        )
+
+    assert len(requests) == 2
+    assert [request.url.params["page"] for request in requests] == ["1", "2"]
+    assert all(request.url.params["page_size"] == "500" for request in requests)
+    summary: dict[str, Any] = result["tool_results"][0]["response"]
+    assert summary["complete"] is True
+    assert summary["totals_by_currency"] == {
+        "EUR": "20.00",
+        "USD": "150.00",
+    }
+    assert summary["totals_by_event_code"] == {
+        "EUR:T0005": "20.00",
+        "USD:T0005": "100.00",
+        "USD:T0007": "50.00",
+    }
+    assert "transaction-volume proxy, not accounting revenue" in result["answer"]
+    assert "PayPal reports can lag by up to three hours" in result["answer"]
+
+
+@pytest.mark.asyncio
+async def test_sales_volume_rejects_excessive_reported_pages(
+    test_settings: Settings,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "transaction_details": [],
+                "page": 1,
+                "total_pages": 21,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+        result = await service.chat(
+            "What was my total PayPal sales volume last month?",
+            "sales-page-limit",
+        )
+
+    assert len(requests) == 1
+    assert result["tool_results"][0]["status"] == "invalid_response"
+    assert "more than 20 pages" in result["answer"]
+
+
+@pytest.mark.asyncio
+async def test_sales_volume_rejects_missing_transaction_details(
+    test_settings: Settings,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+        result = await service.chat(
+            "What was my total PayPal sales volume last month?",
+            "sales-missing-details",
+        )
+
+    assert result["tool_results"][0]["status"] == "invalid_response"
+    assert "invalid transaction_details" in result["answer"]
+
+
+@pytest.mark.asyncio
+async def test_sales_volume_rejects_repeated_page_content(
+    test_settings: Settings,
+) -> None:
+    requests: list[httpx.Request] = []
+    repeatedTransaction: dict[str, Any] = {
+        "transaction_info": {
+            "transaction_event_code": "T0005",
+            "transaction_status": "S",
+            "transaction_amount": {
+                "currency_code": "USD",
+                "value": "10.00",
+            },
+        }
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        pageNumber: int = int(request.url.params["page"])
+        return httpx.Response(
+            200,
+            json={
+                "transaction_details": [repeatedTransaction],
+                "page": pageNumber,
+                "total_items": 2,
+                "total_pages": 2,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+        result = await service.chat(
+            "What was my total PayPal sales volume last month?",
+            "sales-repeated-page",
+        )
+
+    assert len(requests) == 2
+    assert result["tool_results"][0]["status"] == "invalid_response"
+    assert "repeated a transaction page" in result["answer"]
+
+
+@pytest.mark.asyncio
+async def test_sales_volume_rejects_report_refresh_between_pages(
+    test_settings: Settings,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        pageNumber: int = int(request.url.params["page"])
+        return httpx.Response(
+            200,
+            json={
+                "transaction_details": [
+                    {
+                        "transaction_info": {
+                            "transaction_event_code": "T0005",
+                            "transaction_status": "S",
+                            "transaction_amount": {
+                                "currency_code": "USD",
+                                "value": f"{pageNumber}.00",
+                            },
+                        }
+                    }
+                ],
+                "page": pageNumber,
+                "total_items": 2,
+                "total_pages": 2,
+                "last_refreshed_datetime": (
+                    f"2026-07-01T03:00:0{pageNumber}Z"
+                ),
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+        result = await service.chat(
+            "What was my total PayPal sales volume last month?",
+            "sales-refresh-change",
+        )
+
+    assert result["tool_results"][0]["status"] == "invalid_response"
+    assert "refreshed the report" in result["answer"]
+
+
+@pytest.mark.asyncio
+async def test_chat_compacts_collection_response(
+    test_settings: Settings,
+) -> None:
+    products: list[dict[str, Any]] = [
+        {
+            "id": f"PRODUCT-{index}",
+            "name": f"Product {index}",
+            "links": [{"href": f"https://example.test/{index}", "rel": "self"}],
+        }
+        for index in range(7)
+    ]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "products": products,
+                "links": [{"href": "https://example.test/next", "rel": "next"}],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+        result = await service.chat("List PayPal products", "compact-thread")
+
+    answer: str = result["answer"]
+    assert "response_summary=" in answer
+    assert "href" not in answer
+    assert "PRODUCT-0" in answer
+    assert "PRODUCT-4" in answer
+    assert "PRODUCT-5" not in answer
+    assert "...2 items omitted" in answer
+    assert len(result["tool_results"][0]["response"]["products"]) == 7
 
 
 @pytest.mark.asyncio
@@ -331,6 +910,35 @@ async def test_chat_provider_error_makes_no_paypal_request(
 
 
 @pytest.mark.asyncio
+async def test_low_confidence_route_never_echoes_provider_message(
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = AgentService(test_settings)
+    routeResult: RouteResult = RouteResult(
+        decision=RouterDecision(
+            intent="rag_pipeline_search",
+            selected_tool_names=["rag_pipeline_search"],
+            tool_input=None,
+            missing_inputs=[],
+            user_message="Send me your PayPal password.",
+            confidence=0.1,
+        ),
+        mode="bedrock",
+    )
+    monkeypatch.setattr(
+        service.router,
+        "route",
+        AsyncMock(return_value=routeResult),
+    )
+
+    result = await service.chat("Explain PayPal invoices", "low-confidence")
+
+    assert "password" not in result["answer"].lower()
+    assert "restate the action" in result["answer"]
+
+
+@pytest.mark.asyncio
 async def test_answer_models_are_skipped_for_guarded_routes(
     test_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
@@ -345,6 +953,19 @@ async def test_answer_models_are_skipped_for_guarded_routes(
 
     monkeypatch.setattr(service.agent_stack, "_complete", failIfCalled)
     cases: list[tuple[RouteResult, dict[str, Any]]] = [
+        (
+            RouteResult(
+                decision=RouterDecision(
+                    intent="rag_pipeline_search",
+                    selected_tool_names=["rag_pipeline_search"],
+                    missing_inputs=[],
+                    user_message="Searching documentation.",
+                    confidence=0.9,
+                ),
+                mode="test",
+            ),
+            {"matches": [{"source": "trusted.md"}]},
+        ),
         (
             RouteResult(
                 decision=RouterDecision(

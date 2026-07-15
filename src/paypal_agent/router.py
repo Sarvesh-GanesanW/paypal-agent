@@ -15,11 +15,29 @@ DOMAIN_HINTS = {
     "payout": {"batch", "payout", "payouts"},
     "refund": {"capture", "payments", "refund", "refunds"},
     "report": {"balances", "reporting", "transactions"},
+    "sale": {"reporting", "transaction", "transactions"},
+    "sales": {"reporting", "transaction", "transactions"},
     "token": {"payment-tokens", "setup-tokens", "token", "tokens", "vault"},
     "tracking": {"shipment", "shipping", "tracker", "trackers", "tracking"},
     "transaction": {"balances", "reporting", "transaction", "transactions"},
+    "volume": {"reporting", "transaction", "transactions"},
     "webhook": {"event", "notification", "webhook", "webhooks"},
 }
+QUERY_STOP_WORDS: frozenset[str] = frozenset(
+    {
+        "are",
+        "available",
+        "can",
+        "for",
+        "have",
+        "paypal",
+        "tool",
+        "tools",
+        "what",
+        "which",
+        "with",
+    }
+)
 
 
 class ToolRouter:
@@ -49,7 +67,7 @@ class ToolRouter:
 
 
 def _expanded_terms(query: str) -> set[str]:
-    terms = set(_token_counts(query))
+    terms: set[str] = set(_token_counts(query)) - QUERY_STOP_WORDS
     for term in list(terms):
         terms.update(DOMAIN_HINTS.get(term, set()))
     return terms

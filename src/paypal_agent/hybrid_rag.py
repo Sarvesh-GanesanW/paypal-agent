@@ -47,6 +47,12 @@ class HybridRagPipeline:
                         "titles": [chunk["title"] for chunk in chunks[:limit]],
                     }
                 )
+            if not chunks:
+                return self._markdownFallback(
+                    query,
+                    limit=limit,
+                    hybridAvailable=True,
+                )
             with traceRun(
                 self.settings,
                 "rag_rerank",
@@ -67,25 +73,18 @@ class HybridRagPipeline:
                     }
                 )
         except Exception:
-            with traceRun(
-                self.settings,
-                "rag_markdown_fallback",
-                "retriever",
-                inputs={"query_length": len(query), "limit": limit},
-                tags=["rag", "fallback"],
-            ) as trace:
-                fallback = self.markdown_fallback.search(query, limit=limit)
-                trace.end(
-                    {
-                        "match_count": len(fallback["matches"]),
-                        "hybrid_rag_available": False,
-                    }
-                )
-            fallback["mode"] = "markdown_fallback"
-            fallback["error"] = (
-                "Hybrid RAG was unavailable; used local markdown fallback."
+            return self._markdownFallback(
+                query,
+                limit=limit,
+                hybridAvailable=False,
             )
-            return fallback
+
+        if not reranked:
+            return self._markdownFallback(
+                query,
+                limit=limit,
+                hybridAvailable=True,
+            )
 
         return {
             "status": "success",
@@ -101,3 +100,38 @@ class HybridRagPipeline:
                 for chunk in reranked[:limit]
             ],
         }
+
+    def _markdownFallback(
+        self,
+        query: str,
+        *,
+        limit: int,
+        hybridAvailable: bool,
+    ) -> dict[str, Any]:
+        with traceRun(
+            self.settings,
+            "rag_markdown_fallback",
+            "retriever",
+            inputs={"query_length": len(query), "limit": limit},
+            tags=["rag", "fallback"],
+        ) as trace:
+            fallback: dict[str, Any] = self.markdown_fallback.search(
+                query,
+                limit=limit,
+            )
+            trace.end(
+                {
+                    "match_count": len(fallback["matches"]),
+                    "hybrid_rag_available": hybridAvailable,
+                }
+            )
+        fallback["mode"] = "markdown_fallback"
+        if hybridAvailable:
+            fallback["error"] = (
+                "Hybrid RAG returned no matches; used local markdown fallback."
+            )
+        else:
+            fallback["error"] = (
+                "Hybrid RAG was unavailable; used local markdown fallback."
+            )
+        return fallback

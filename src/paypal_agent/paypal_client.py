@@ -23,7 +23,8 @@ SECRET_HEADERS = {"authorization", "paypal-auth-assertion"}
 VARIABLE_PATTERN = re.compile(r"{{([^{}]+)}}")
 TOKEN_EXPIRY_SKEW_SECONDS = 30.0
 MAX_TRANSACTION_PAGE = 10_000
-MAX_TRANSACTION_PAGE_SIZE = 100
+DEFAULT_TRANSACTION_PAGE_SIZE = 100
+MAX_TRANSACTION_PAGE_SIZE = 500
 SAFE_FIXED_QUERY_PARAMETERS = {
     ("/v1/identity/oauth2/userinfo", "schema"): "paypalv1.1",
 }
@@ -769,7 +770,7 @@ def _validate_transaction_query(query: dict[str, Any]) -> None:
         MAX_TRANSACTION_PAGE,
     )
     query["page_size"] = _clamped_integer(
-        query.get("page_size", MAX_TRANSACTION_PAGE_SIZE),
+        query.get("page_size", DEFAULT_TRANSACTION_PAGE_SIZE),
         "page_size",
         1,
         MAX_TRANSACTION_PAGE_SIZE,

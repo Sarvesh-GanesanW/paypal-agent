@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import UUID4, BaseModel, Field
 
 from paypal_agent.agent_service import AgentService
 from paypal_agent.paypal_client import ClientInputError, ToolCallInput
@@ -15,10 +16,10 @@ service = AgentService()
 
 
 class ChatRequest(BaseModel):
-    user_input: str = Field(alias="userInput", min_length=1)
-    conversation_id: str = Field(default="default", alias="conversationId")
+    user_input: str = Field(alias="userInput", min_length=1, max_length=8192)
+    conversation_id: UUID4 | None = Field(default=None, alias="conversationId")
 
-    model_config = {"populate_by_name": True}
+    model_config = {"populate_by_name": True, "str_strip_whitespace": True}
 
 
 @app.get("/")
@@ -27,7 +28,7 @@ async def root() -> dict[str, Any]:
         "name": "Datazoic PayPal Agent",
         "status": "healthy",
         "paypal_tool_count": len(service.registry.tools),
-        "router": "small_model_strict_schema",
+        "router": "small_model_validated_routing",
         "orchestrator": "langgraph_state_graph",
         "model_provider": service.settings.model_provider,
         "router_model": service.settings.router_model_id,
@@ -46,7 +47,13 @@ async def health() -> dict[str, str]:
 
 @app.post("/chat")
 async def chat(request: ChatRequest) -> dict[str, Any]:
-    return await service.chat(request.user_input, request.conversation_id)
+    conversationId: str = str(request.conversation_id or uuid4())
+    result: dict[str, Any] = await service.chat(
+        request.user_input,
+        conversationId,
+    )
+    result["conversationId"] = conversationId
+    return result
 
 
 @app.get("/tools")

@@ -19,7 +19,12 @@ def defaultPostmanCollectionPath() -> Path:
 
 def defaultKnowledgeBasePath() -> Path:
     resource = files("paypal_agent").joinpath("assets", "knowledge_base")
-    return Path(str(resource))
+    packagedPath: Path = Path(str(resource))
+    projectPath: Path = Path(__file__).resolve().parents[2] / "data/paypal_docs"
+    for candidatePath in (projectPath, packagedPath):
+        if candidatePath.is_dir() and next(candidatePath.glob("*.md"), None):
+            return candidatePath
+    return packagedPath
 
 
 def resolvePostmanCollectionPath(collectionPath: Path) -> Path:

@@ -140,7 +140,7 @@ curl "http://localhost:8000/tools/search?query=send%20invoice&limit=5"
 curl http://localhost:8000/observability
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
-  -d '{"userInput":"show order ORDER-123","conversationId":"demo"}'
+  -d '{"userInput":"show order ORDER-123"}'
 ```
 
 `/chat` calls PayPal only when routing produces one unambiguous read-only tool
@@ -149,6 +149,11 @@ inputs, ambiguity, low confidence, or a model-provider failure returns a
 clarification and makes no PayPal request. A mutating chat request also makes
 no PayPal request; it returns an unconfirmed direct-call payload for the user
 to review. The separate direct caller must add confirmation.
+
+The first `/chat` response includes a random UUIDv4 `conversationId`. Treat it
+as a bearer session token and send it on follow-up turns. The API no longer
+shares a default conversation across callers; supplied conversation IDs must
+be UUIDv4 values.
 
 Flush buffered LangSmith traces after a demo run:
 
@@ -235,8 +240,11 @@ links as pagination metadata.
 
 Transaction Search requires `start_date` and `end_date`, accepts either
 `YYYY-MM-DD` or RFC3339 timestamps, and rejects ranges longer than 31 days. It
-defaults to `page=1` and `page_size=100`, clamps `page_size` to 100, and still
-sends only that one page.
+defaults to `page=1` and `page_size=100` and clamps `page_size` to PayPal's 500
+item maximum. Ordinary list requests still send one page. Sales-volume prompts
+retrieve every reported page up to PayPal's 10,000-record search limit, then
+return a currency-separated completed-positive-payment proxy with its T-code
+definition and exclusions rather than presenting it as accounting revenue.
 
 The direct tool endpoint supports collection-declared raw JSON, URL-encoded,
 and multipart request bodies. Multipart calls are rejected unless

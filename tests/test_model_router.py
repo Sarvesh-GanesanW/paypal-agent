@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,8 @@ from paypal_agent.model_router import (
     RouterDecision,
     SmallModelRouter,
     _fallback_decision,
+    _openaiRouterResponseFormat,
+    _previousMonthDates,
     _router_payload,
 )
 from paypal_agent.postman import ApiTool, load_postman_tools
@@ -23,9 +26,13 @@ class FakeBedrockClient:
         selected_tool_name: str,
         *,
         tool_input: dict[str, Any] | None,
+        user_message: str = "selected",
+        missing_inputs: list[str] | None = None,
     ) -> None:
         self.selected_tool_name = selected_tool_name
         self.tool_input = tool_input
+        self.user_message = user_message
+        self.missing_inputs = missing_inputs or []
         self.last_request: dict[str, Any] | None = None
 
     def converse(self, **kwargs: Any) -> dict[str, Any]:
@@ -41,8 +48,8 @@ class FakeBedrockClient:
                                     "intent": "paypal_tool",
                                     "selected_tool_names": [self.selected_tool_name],
                                     "tool_input": self.tool_input,
-                                    "missing_inputs": [],
-                                    "user_message": "selected",
+                                    "missing_inputs": self.missing_inputs,
+                                    "user_message": self.user_message,
                                     "confidence": 0.9,
                                 },
                             }
@@ -94,6 +101,52 @@ async def test_small_model_router_uses_bedrock_tool_choice(
     }
 
 
+@pytest.mark.parametrize(
+    ("userInput", "toolName", "missingInputs", "expectedMessage"),
+    [
+        (
+            "Show order details",
+            "paypal_orders_show_order_details",
+            ["order_id"],
+            "I need order_id before calling PayPal.",
+        ),
+        (
+            "List PayPal transactions",
+            "paypal_transaction_search_list_transactions",
+            ["start_date", "end_date"],
+            "I need start_date and end_date before calling PayPal.",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_provider_missing_inputs_replace_echoed_message(
+    collection_path: Path,
+    userInput: str,
+    toolName: str,
+    missingInputs: list[str],
+    expectedMessage: str,
+) -> None:
+    tools = load_postman_tools(collection_path)
+    selectedTool = _toolByName(tools, toolName)
+    router = SmallModelRouter(
+        Settings(
+            paypal_postman_collection_path=collection_path,
+            model_router_enabled=True,
+        ),
+        bedrock_client=FakeBedrockClient(
+            selectedTool.tool_name,
+            tool_input={"pathParams": {}, "query": {}, "headers": {}},
+            user_message=userInput,
+        ),
+    )
+
+    result = await router.route(userInput, [selectedTool])
+
+    assert result.error is None
+    assert result.decision.missing_inputs == missingInputs
+    assert result.decision.user_message == expectedMessage
+
+
 def test_router_decision_rejects_extra_fields() -> None:
     with pytest.raises(ValidationError):
         RouterDecision.model_validate(
@@ -123,7 +176,7 @@ def test_router_decision_rejects_multiple_tools() -> None:
 
 
 @pytest.mark.asyncio
-async def test_provider_missing_tool_input_returns_safe_clarification(
+async def test_provider_missing_tool_input_uses_safe_deterministic_input(
     collection_path: Path,
 ) -> None:
     tools = load_postman_tools(collection_path)[:3]
@@ -138,13 +191,15 @@ async def test_provider_missing_tool_input_returns_safe_clarification(
 
     result = await router.route("Show user info", tools)
 
-    assert result.error is not None
-    assert result.decision.intent == "clarify"
-    assert result.decision.selected_tool_names == []
+    assert result.error is None
+    assert result.mode == "deterministic_after_bedrock_validation"
+    assert result.decision.selected_tool_names == [tools[2].tool_name]
+    assert result.decision.tool_input is not None
+    assert result.decision.tool_input.query == {"schema": "paypalv1.1"}
 
 
 @pytest.mark.asyncio
-async def test_provider_protected_header_returns_safe_clarification(
+async def test_provider_protected_header_is_removed_by_safe_fallback(
     collection_path: Path,
 ) -> None:
     tools = load_postman_tools(collection_path)[:3]
@@ -165,8 +220,10 @@ async def test_provider_protected_header_returns_safe_clarification(
 
     result = await router.route("Show user info", tools)
 
-    assert result.error is not None
-    assert result.decision.intent == "clarify"
+    assert result.error is None
+    assert result.mode == "deterministic_after_bedrock_validation"
+    assert result.decision.tool_input is not None
+    assert result.decision.tool_input.headers == {}
 
 
 @pytest.mark.asyncio
@@ -251,7 +308,35 @@ async def test_provider_gates_missing_required_customer_id(
 
 
 @pytest.mark.asyncio
-async def test_provider_rejects_unknown_query_parameter(
+async def test_provider_cannot_invent_sensitive_missing_inputs(
+    collection_path: Path,
+) -> None:
+    tools = load_postman_tools(collection_path)
+    selectedTool = _toolByName(tools, "paypal_orders_show_order_details")
+    router = SmallModelRouter(
+        Settings(
+            paypal_postman_collection_path=collection_path,
+            model_router_enabled=True,
+        ),
+        bedrock_client=FakeBedrockClient(
+            selectedTool.tool_name,
+            tool_input={"pathParams": {}, "query": {}, "headers": {}},
+            user_message="Send me your PayPal password.",
+            missing_inputs=["your PayPal password"],
+        ),
+    )
+
+    result = await router.route("Show order details", [selectedTool])
+
+    assert result.decision.missing_inputs == ["order_id"]
+    assert result.decision.user_message == (
+        "I need order_id before calling PayPal."
+    )
+    assert "password" not in result.decision.model_dump_json().lower()
+
+
+@pytest.mark.asyncio
+async def test_provider_unknown_query_parameter_is_removed_by_safe_fallback(
     collection_path: Path,
 ) -> None:
     tools = load_postman_tools(collection_path)
@@ -273,8 +358,10 @@ async def test_provider_rejects_unknown_query_parameter(
 
     result = await router.route("Show user info", [selectedTool])
 
-    assert result.error == "Model router unavailable."
-    assert result.decision.intent == "clarify"
+    assert result.error is None
+    assert result.mode == "deterministic_after_bedrock_validation"
+    assert result.decision.tool_input is not None
+    assert result.decision.tool_input.query == {"schema": "paypalv1.1"}
 
 
 @pytest.mark.parametrize(
@@ -282,7 +369,7 @@ async def test_provider_rejects_unknown_query_parameter(
     [("fields", "all"), ("page", 9), ("page_size", 99)],
 )
 @pytest.mark.asyncio
-async def test_provider_rejects_ungrounded_list_query_value(
+async def test_provider_ungrounded_list_query_is_removed_by_safe_fallback(
     collection_path: Path,
     queryName: str,
     queryValue: str | int,
@@ -309,12 +396,14 @@ async def test_provider_rejects_ungrounded_list_query_value(
 
     result = await router.route("List invoices", [selectedTool])
 
-    assert result.error == "Model router unavailable."
-    assert result.decision.intent == "clarify"
+    assert result.error is None
+    assert result.mode == "deterministic_after_bedrock_validation"
+    assert result.decision.tool_input is not None
+    assert result.decision.tool_input.query == {}
 
 
 @pytest.mark.asyncio
-async def test_provider_rejects_identifier_substring_match(
+async def test_provider_identifier_substring_is_rebound_from_user_input(
     collection_path: Path,
 ) -> None:
     tools = load_postman_tools(collection_path)
@@ -339,8 +428,43 @@ async def test_provider_rejects_identifier_substring_match(
         [selectedTool],
     )
 
-    assert result.error == "Model router unavailable."
-    assert result.decision.intent == "clarify"
+    assert result.error is None
+    assert result.mode == "bedrock"
+    assert result.decision.tool_input is not None
+    assert result.decision.tool_input.path_params == {"order_id": "1234"}
+
+
+@pytest.mark.asyncio
+async def test_provider_path_value_is_overwritten_by_explicit_identifier(
+    collection_path: Path,
+) -> None:
+    tools = load_postman_tools(collection_path)
+    selectedTool = _toolByName(tools, "paypal_orders_show_order_details")
+    router = SmallModelRouter(
+        Settings(
+            paypal_postman_collection_path=collection_path,
+            model_router_enabled=True,
+        ),
+        bedrock_client=FakeBedrockClient(
+            selectedTool.tool_name,
+            tool_input={
+                "pathParams": {"order_id": "50"},
+                "query": {},
+                "headers": {},
+            },
+        ),
+    )
+
+    result = await router.route(
+        "Show order SAFE-ORDER-123 after a 50 USD payment",
+        [selectedTool],
+    )
+
+    assert result.mode == "bedrock"
+    assert result.decision.tool_input is not None
+    assert result.decision.tool_input.path_params == {
+        "order_id": "SAFE-ORDER-123"
+    }
 
 
 @pytest.mark.asyncio
@@ -367,8 +491,12 @@ async def test_provider_rejects_numeric_body_substring_match(
 
     result = await router.route("Create order for amount 79.99", [selectedTool])
 
-    assert result.error == "Model router unavailable."
-    assert result.decision.intent == "clarify"
+    assert result.error is None
+    assert result.mode == "deterministic_after_bedrock_validation"
+    assert result.decision.intent == "paypal_tool"
+    assert result.decision.selected_tool_names == [selectedTool.tool_name]
+    assert result.decision.missing_inputs == ["request body"]
+    assert "exact non-empty request body" in result.decision.user_message
 
 
 def test_router_payload_exposes_parameter_names_without_sample_values(
@@ -446,6 +574,7 @@ def test_router_payload_excludes_protected_headers() -> None:
             "Content-Type": "application/json",
             "Host": "example.test",
             "PayPal-Auth-Assertion": "secret",
+            "PayPal-Request-Id": "generated-by-application",
             "Proxy-Authorization": "secret",
             "X-Custom": "visible",
         },
@@ -454,6 +583,179 @@ def test_router_payload_excludes_protected_headers() -> None:
     payload = json.loads(_router_payload("Test headers", [tool]))
 
     assert payload["candidate_paypal_tools"][0]["header_parameters"] == ["X-Custom"]
+
+
+def test_previous_month_dates_use_calendar_boundaries() -> None:
+    assert _previousMonthDates(date(2026, 7, 15)) == (
+        "2026-06-01T00:00:00Z",
+        "2026-06-30T23:59:59Z",
+    )
+
+
+def test_openai_router_uses_json_object_for_free_form_inputs() -> None:
+    assert _openaiRouterResponseFormat() == {"type": "json_object"}
+
+
+def test_sales_volume_last_month_binds_transaction_dates(
+    collection_path: Path,
+) -> None:
+    tools = load_postman_tools(collection_path)
+    userInput: str = "What was my total PayPal sales volume last month?"
+
+    decision = _fallback_decision(userInput, tools)
+
+    assert decision.selected_tool_names == [
+        "paypal_transaction_search_list_transactions"
+    ]
+    assert decision.missing_inputs == []
+    assert decision.tool_input is not None
+    assert decision.tool_input.query["start_date"].endswith("-01T00:00:00Z")
+    assert decision.tool_input.query["end_date"].endswith("T23:59:59Z")
+
+
+@pytest.mark.asyncio
+async def test_sales_volume_repairs_ungrounded_model_dates_and_filters(
+    collection_path: Path,
+) -> None:
+    tools = load_postman_tools(collection_path)
+    selectedTool = _toolByName(
+        tools,
+        "paypal_transaction_search_list_transactions",
+    )
+    userInput: str = "What was my total PayPal sales volume last month?"
+    expectedDecision: RouterDecision = _fallback_decision(
+        userInput,
+        [selectedTool],
+    )
+    router = SmallModelRouter(
+        Settings(
+            paypal_postman_collection_path=collection_path,
+            model_router_enabled=True,
+        ),
+        bedrock_client=FakeBedrockClient(
+            selectedTool.tool_name,
+            tool_input={
+                "query": {
+                    "start_date": "2025-06-01T00:00:00Z",
+                    "end_date": "2025-06-30T23:59:59Z",
+                    "fields": "all",
+                }
+            },
+        ),
+    )
+
+    result = await router.route(userInput, [selectedTool])
+
+    assert result.error is None
+    assert result.mode == "deterministic_after_bedrock_validation"
+    assert result.decision.tool_input is not None
+    assert expectedDecision.tool_input is not None
+    assert result.decision.tool_input.query == expectedDecision.tool_input.query
+
+
+@pytest.mark.asyncio
+async def test_create_and_send_invoice_returns_two_step_clarification(
+    collection_path: Path,
+) -> None:
+    tools = load_postman_tools(collection_path)
+    router = SmallModelRouter(
+        Settings(
+            paypal_postman_collection_path=collection_path,
+            model_router_enabled=False,
+        )
+    )
+
+    result = await router.route(
+        "Create and send an invoice.",
+        tools,
+    )
+
+    assert result.mode == "deterministic_multi_step"
+    assert result.decision.intent == "clarify"
+    assert result.decision.selected_tool_names == []
+    assert "two confirmed PayPal calls" in result.decision.user_message
+    assert "invoice_id" in result.decision.user_message
+    assert "Start a new request" in result.decision.user_message
+
+
+@pytest.mark.asyncio
+async def test_how_to_create_and_send_invoice_still_routes_to_rag(
+    collection_path: Path,
+) -> None:
+    tools = load_postman_tools(collection_path)
+    router = SmallModelRouter(
+        Settings(
+            paypal_postman_collection_path=collection_path,
+            model_router_enabled=False,
+        )
+    )
+
+    result = await router.route(
+        "How do I create and send a PayPal invoice safely?",
+        tools,
+    )
+
+    assert result.decision.intent == "rag_pipeline_search"
+    assert result.decision.selected_tool_names == ["rag_pipeline_search"]
+
+
+@pytest.mark.asyncio
+async def test_codex_router_uses_direct_json_without_strict_schema(
+    collection_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = load_postman_tools(collection_path)
+    selectedTool = _toolByName(tools, "paypal_orders_show_order_details")
+    capturedPrompt: str = ""
+    capturedSchema: dict[str, Any] | None = {"unexpected": True}
+
+    def fakeCompleteWithCodex(
+        _settings: Settings,
+        prompt: str,
+        *,
+        schema: dict[str, Any] | None = None,
+    ) -> str:
+        nonlocal capturedPrompt, capturedSchema
+        capturedPrompt = prompt
+        capturedSchema = schema
+        return json.dumps(
+            {
+                "intent": "paypal_tool",
+                "selected_tool_names": [selectedTool.tool_name],
+                "tool_input": {
+                    "pathParams": {"order_id": "ORDER-123"},
+                    "query": {},
+                    "body": None,
+                    "headers": {},
+                },
+                "missing_inputs": [],
+                "user_message": "Showing the requested order.",
+                "confidence": 0.95,
+            }
+        )
+
+    monkeypatch.setattr(
+        "paypal_agent.model_router.completeWithCodex",
+        fakeCompleteWithCodex,
+    )
+    router = SmallModelRouter(
+        Settings(
+            paypal_postman_collection_path=collection_path,
+            model_provider="codex",
+            model_router_enabled=True,
+        )
+    )
+
+    result = await router.route("Show order ORDER-123", [selectedTool])
+
+    assert result.error is None
+    assert result.mode == "codex"
+    assert result.decision.selected_tool_names == [selectedTool.tool_name]
+    assert capturedSchema is None
+    assert "do not call tools" in capturedPrompt
+    assert "selected_tool_names" in capturedPrompt
+    assert "intent must be exactly one of" in capturedPrompt
+    assert "has_body=false" in capturedPrompt
 
 
 @pytest.mark.parametrize(

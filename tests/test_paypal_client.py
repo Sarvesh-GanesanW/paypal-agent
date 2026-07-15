@@ -347,7 +347,7 @@ async def test_transaction_query_normalizes_dates_and_bounds_page(
         assert request.url.params["start_date"] == "2026-06-01T00:00:00Z"
         assert request.url.params["end_date"] == "2026-06-30T23:59:59Z"
         assert request.url.params["page"] == "1"
-        assert request.url.params["page_size"] == "100"
+        assert request.url.params["page_size"] == "500"
         return httpx.Response(200, json={"transaction_details": []})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -364,7 +364,7 @@ async def test_transaction_query_normalizes_dates_and_bounds_page(
             ),
         )
 
-    assert result["request"]["query"]["page_size"] == 100
+    assert result["request"]["query"]["page_size"] == 500
 
 
 @pytest.mark.asyncio

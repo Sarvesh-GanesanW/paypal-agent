@@ -8,7 +8,7 @@ import boto3
 
 from paypal_agent.codex_provider import completeWithCodex
 from paypal_agent.config import Settings
-from paypal_agent.model_router import RouteResult
+from paypal_agent.model_router import SUPPORT_TOOL_NAMES, RouteResult
 from paypal_agent.tracing import traceRun
 
 
@@ -38,6 +38,7 @@ class BedrockAgentStack:
         decision = route_result.decision
         if (
             route_result.error
+            or decision.intent in SUPPORT_TOOL_NAMES
             or decision.intent == "clarify"
             or decision.missing_inputs
             or decision.confidence < 0.5

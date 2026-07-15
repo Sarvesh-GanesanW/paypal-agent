@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+import re
+import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from threading import Lock
 from typing import Any, Literal, NotRequired, TypedDict, cast
 
 import httpx
@@ -14,11 +21,14 @@ from paypal_agent.config import Settings, settings
 from paypal_agent.hybrid_rag import HybridRagPipeline
 from paypal_agent.local_memory import LocalMemoryStore
 from paypal_agent.model_router import (
+    SUPPORT_TOOL_NAMES,
     BedrockRuntimeClient,
     RoutedToolInput,
     RouterDecision,
     RouteResult,
     SmallModelRouter,
+    _fallback_decision,
+    missingInputMessage,
 )
 from paypal_agent.package_assets import (
     defaultKnowledgeBasePath,
@@ -54,10 +64,28 @@ GraphNodeName = Literal[
     "orchestrate_answer",
     "record_request",
 ]
+MAX_PENDING_CONVERSATIONS = 100
+MAX_PENDING_INPUT_CHARS = 8192
+MAX_USER_INPUT_CHARS = 8192
+MAX_CONVERSATION_ID_CHARS = 128
+PENDING_REQUEST_TTL_SECONDS = 900.0
+CONVERSATION_LOCK_STRIPES = 64
+TRANSACTION_SEARCH_PATH = "/v1/reporting/transactions"
+TRANSACTION_AGGREGATION_PAGE_SIZE = 500
+MAX_TRANSACTION_AGGREGATION_RECORDS = 10_000
+MAX_TRANSACTION_AGGREGATION_PAGES = (
+    MAX_TRANSACTION_AGGREGATION_RECORDS // TRANSACTION_AGGREGATION_PAGE_SIZE
+)
+MAX_RESPONSE_LIST_ITEMS = 5
+MAX_RESPONSE_STRING_CHARS = 500
+WORD_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+PAYMENT_EVENT_CODE_PATTERN = re.compile(r"^T00\d{2}$")
+CURRENCY_CODE_PATTERN = re.compile(r"^[A-Z]{3}$")
 
 
 class ChatGraphState(TypedDict):
     user_input: str
+    routing_input: str
     conversation_id: str
     candidates: NotRequired[list[ApiTool]]
     route_result: NotRequired[RouteResult]
@@ -106,9 +134,26 @@ class AgentService:
             knowledge_dir or defaultKnowledgeBasePath(),
         )
         self.system_search = SystemSearch(self.registry, self.request_log)
+        self.pending_requests: OrderedDict[
+            str,
+            tuple[str, str, float],
+        ] = OrderedDict()
+        self.conversationLocks: tuple[asyncio.Lock, ...] = tuple(
+            asyncio.Lock() for _index in range(CONVERSATION_LOCK_STRIPES)
+        )
+        self.pendingRequestsLock: Lock = Lock()
         self.chat_graph: Any = self._build_chat_graph()
 
     async def chat(self, user_input: str, conversation_id: str) -> dict[str, Any]:
+        self._validateChatInput(user_input, conversation_id)
+        async with self._conversationLock(conversation_id):
+            return await self._chatUnlocked(user_input, conversation_id)
+
+    async def _chatUnlocked(
+        self,
+        user_input: str,
+        conversation_id: str,
+    ) -> dict[str, Any]:
         with traceRun(
             self.settings,
             "paypal_agent_chat",
@@ -126,10 +171,7 @@ class AgentService:
             tags=["chat", "paypal-agent"],
         ) as chat_trace:
             finalState = await self.chat_graph.ainvoke(
-                {
-                    "user_input": user_input,
-                    "conversation_id": conversation_id,
-                }
+                self._initialGraphState(user_input, conversation_id)
             )
             result = finalState["result"]
             route_result = finalState["route_result"]
@@ -144,6 +186,19 @@ class AgentService:
             return result
 
     async def stream_chat(
+        self,
+        user_input: str,
+        conversation_id: str,
+    ) -> AsyncIterator[ChatStreamEvent]:
+        self._validateChatInput(user_input, conversation_id)
+        async with self._conversationLock(conversation_id):
+            async for event in self._streamChatUnlocked(
+                user_input,
+                conversation_id,
+            ):
+                yield event
+
+    async def _streamChatUnlocked(
         self,
         user_input: str,
         conversation_id: str,
@@ -167,11 +222,12 @@ class AgentService:
         ) as chat_trace:
             finalResult: dict[str, Any] | None = None
             finalRoute: RouteResult | None = None
+            initialState: ChatGraphState = self._initialGraphState(
+                user_input,
+                conversation_id,
+            )
             async for update in self.chat_graph.astream(
-                {
-                    "user_input": user_input,
-                    "conversation_id": conversation_id,
-                },
+                initialState,
                 stream_mode="updates",
             ):
                 if not isinstance(update, dict):
@@ -195,12 +251,7 @@ class AgentService:
                                 nodeUpdate["route_result"],
                             )
             if finalResult is None:
-                finalState = await self.chat_graph.ainvoke(
-                    {
-                        "user_input": user_input,
-                        "conversation_id": conversation_id,
-                    }
-                )
+                finalState = await self.chat_graph.ainvoke(initialState)
                 finalResult = finalState["result"]
                 finalRoute = finalState["route_result"]
             assert finalResult is not None
@@ -216,6 +267,72 @@ class AgentService:
                     }
                 )
             yield ChatStreamEvent(event="result", result=finalResult)
+
+    def _validateChatInput(self, userInput: str, conversationId: str) -> None:
+        if not userInput.strip():
+            raise ValueError("user_input must not be blank.")
+        if len(userInput) > MAX_USER_INPUT_CHARS:
+            raise ValueError(
+                f"user_input must not exceed {MAX_USER_INPUT_CHARS} characters."
+            )
+        if not conversationId.strip():
+            raise ValueError("conversation_id must not be blank.")
+        if len(conversationId) > MAX_CONVERSATION_ID_CHARS:
+            raise ValueError(
+                "conversation_id must not exceed "
+                f"{MAX_CONVERSATION_ID_CHARS} characters."
+            )
+
+    def _conversationLock(self, conversationId: str) -> asyncio.Lock:
+        lockIndex: int = hash(conversationId) % len(self.conversationLocks)
+        return self.conversationLocks[lockIndex]
+
+    def _initialGraphState(
+        self,
+        userInput: str,
+        conversationId: str,
+    ) -> ChatGraphState:
+        return {
+            "user_input": userInput,
+            "routing_input": self._routingInput(userInput, conversationId),
+            "conversation_id": conversationId,
+        }
+
+    def _routingInput(self, userInput: str, conversationId: str) -> str:
+        with self.pendingRequestsLock:
+            self._purgeExpiredPendingRequests()
+            pendingRequest: tuple[str, str, float] | None = (
+                self.pending_requests.get(conversationId)
+            )
+            if pendingRequest is None:
+                return userInput
+            previousInput, pendingToolName, _expiresAt = pendingRequest
+            self.pending_requests.move_to_end(conversationId)
+            if self._startsNewRequest(userInput, pendingToolName):
+                self.pending_requests.pop(conversationId, None)
+                return userInput
+        combinedInput: str = (
+            "Previous unresolved PayPal request:\n"
+            + previousInput
+            + "\nLatest user message:\n"
+            + userInput
+        )
+        return _boundedPendingInput(combinedInput)
+
+    def _startsNewRequest(self, userInput: str, pendingToolName: str) -> bool:
+        candidates: list[ApiTool] = self.registry.search(
+            userInput,
+            limit=self.settings.max_selected_tools,
+        )
+        independentDecision: RouterDecision = _fallback_decision(
+            userInput,
+            candidates,
+        )
+        if independentDecision.intent in SUPPORT_TOOL_NAMES:
+            return True
+        if independentDecision.intent == "paypal_tool":
+            return independentDecision.selected_tool_names != [pendingToolName]
+        return False
 
     def _build_chat_graph(self) -> Any:
         graph = StateGraph(ChatGraphState)
@@ -258,14 +375,14 @@ class AgentService:
         self,
         state: ChatGraphState,
     ) -> dict[str, list[ApiTool]]:
-        return {"candidates": self._shortlist_tools(state["user_input"])}
+        return {"candidates": self._shortlist_tools(state["routing_input"])}
 
     async def _graph_route_request(
         self,
         state: ChatGraphState,
     ) -> dict[str, RouteResult]:
         routeResult: RouteResult = await self._route_request(
-            state["user_input"],
+            state["routing_input"],
             self._state_candidates(state),
         )
         return {
@@ -283,7 +400,7 @@ class AgentService:
         ):
             return routeResult
         missingInputs: list[str] = list(decision.missing_inputs)
-        if "body" not in missingInputs:
+        if not {"body", "request body"} & set(missingInputs):
             missingInputs.append("body")
         updatedDecision: RouterDecision = decision.model_copy(
             update={
@@ -352,9 +469,19 @@ class AgentService:
         self,
         state: ChatGraphState,
     ) -> dict[str, Any]:
-        decision = self._state_route_result(state).decision
+        routeResult: RouteResult = self._state_route_result(state)
+        decision: RouterDecision = routeResult.decision
+        if routeResult.mode == "deterministic_multi_step":
+            fallbackAnswer: str = decision.user_message
+        elif decision.intent == "paypal_tool" and decision.missing_inputs:
+            fallbackAnswer = missingInputMessage(decision.missing_inputs)
+        else:
+            fallbackAnswer = (
+                "I could not safely verify one exact PayPal request. Please "
+                "restate the action with its required IDs, dates, and filters."
+            )
         return {
-            "fallback_answer": decision.user_message,
+            "fallback_answer": fallbackAnswer,
             "route_payload": {
                 "missing_inputs": decision.missing_inputs,
                 "router_decision": decision.model_dump(by_alias=True),
@@ -367,7 +494,8 @@ class AgentService:
         state: ChatGraphState,
     ) -> dict[str, Any]:
         fallbackAnswer, routePayload = await self._paypal_answer(
-            self._state_route_result(state).decision
+            self._state_route_result(state).decision,
+            state["routing_input"],
         )
         return {"fallback_answer": fallbackAnswer, "route_payload": routePayload}
 
@@ -389,6 +517,7 @@ class AgentService:
     ) -> dict[str, dict[str, Any]]:
         routeResult = self._state_route_result(state)
         candidates = self._state_candidates(state)
+        self._updatePendingRequest(state, routeResult)
         self.request_log.append(
             {
                 "event_type": "chat",
@@ -441,6 +570,42 @@ class AgentService:
                 },
             }
         }
+
+    def _updatePendingRequest(
+        self,
+        state: ChatGraphState,
+        routeResult: RouteResult,
+    ) -> None:
+        conversationId: str = state["conversation_id"]
+        decision: RouterDecision = routeResult.decision
+        with self.pendingRequestsLock:
+            self._purgeExpiredPendingRequests()
+            if (
+                decision.intent == "paypal_tool"
+                and len(decision.selected_tool_names) == 1
+                and decision.missing_inputs
+            ):
+                self.pending_requests[conversationId] = (
+                    _boundedPendingInput(state["routing_input"]),
+                    decision.selected_tool_names[0],
+                    time.monotonic() + PENDING_REQUEST_TTL_SECONDS,
+                )
+                self.pending_requests.move_to_end(conversationId)
+                while len(self.pending_requests) > MAX_PENDING_CONVERSATIONS:
+                    self.pending_requests.popitem(last=False)
+                return
+            if routeResult.error is None:
+                self.pending_requests.pop(conversationId, None)
+
+    def _purgeExpiredPendingRequests(self) -> None:
+        currentTime: float = time.monotonic()
+        expiredConversationIds: list[str] = [
+            conversationId
+            for conversationId, pendingRequest in self.pending_requests.items()
+            if pendingRequest[2] <= currentTime
+        ]
+        for conversationId in expiredConversationIds:
+            self.pending_requests.pop(conversationId, None)
 
     def _state_candidates(self, state: ChatGraphState) -> list[ApiTool]:
         return cast(list[ApiTool], state.get("candidates", []))
@@ -642,8 +807,10 @@ class AgentService:
             if not result["matches"]:
                 trace.end({"match_count": 0})
                 return "No matching local documentation was found.", result
-            answer = "\n".join(
-                f"{match['source']}: {match['snippet']}" for match in result["matches"]
+            answerLines: list[str] = ["PayPal documentation matches:"]
+            answerLines.extend(
+                f"- {match['source']}: {match['snippet']}"
+                for match in result["matches"]
             )
             trace.end(
                 {
@@ -651,7 +818,7 @@ class AgentService:
                     "match_count": len(result["matches"]),
                 }
             )
-            return answer, result
+            return "\n".join(answerLines), result
 
     def _system_search_answer(self, user_input: str) -> tuple[str, dict[str, Any]]:
         with traceRun(
@@ -668,10 +835,29 @@ class AgentService:
                     "matching_request_count": len(result["matching_requests"]),
                 }
             )
-            return (
-                "Matching tools: "
-                + ", ".join(tool["tool_name"] for tool in result["matching_tools"][:5])
-            ), result
+            answerLines: list[str] = []
+            matchingTools: list[dict[str, Any]] = result["matching_tools"][:8]
+            if matchingTools:
+                answerLines.append("Matching PayPal tools:")
+                answerLines.extend(
+                    "- "
+                    + str(tool["display_name"])
+                    + ": "
+                    + str(tool["method"])
+                    + " "
+                    + str(tool["path"])
+                    for tool in matchingTools
+                )
+            matchingRequests: list[dict[str, Any]] = result["matching_requests"][:5]
+            if matchingRequests:
+                answerLines.append("Matching recent request metadata:")
+                answerLines.extend(
+                    "- " + json.dumps(request, sort_keys=True)
+                    for request in matchingRequests
+                )
+            if not answerLines:
+                answerLines.append("No matching tools or request metadata found.")
+            return "\n".join(answerLines), result
 
     def _memory_grep_answer(self, user_input: str) -> tuple[str, dict[str, Any]]:
         with traceRun(
@@ -714,6 +900,7 @@ class AgentService:
     async def _paypal_answer(
         self,
         decision: RouterDecision,
+        userInput: str,
     ) -> tuple[str, dict[str, Any]]:
         selectedToolNames: list[str] = decision.selected_tool_names
         routedInput: RoutedToolInput | None = decision.tool_input
@@ -767,31 +954,10 @@ class AgentService:
                 "tool_call_results": [],
             }
 
-        result: dict[str, Any]
-        try:
-            result = await self.paypal_client.execute(tool, payload)
-        except ClientInputError as error:
-            result = {
-                "status": "rejected",
-                "status_code": None,
-                "request_sent": False,
-                "tool": tool.to_dict(),
-                "error": str(error),
-            }
-        except httpx.TimeoutException:
-            result = {
-                "status": "client_error",
-                "status_code": None,
-                "tool": tool.to_dict(),
-                "error": "PayPal request timed out.",
-            }
-        except httpx.RequestError:
-            result = {
-                "status": "client_error",
-                "status_code": None,
-                "tool": tool.to_dict(),
-                "error": "PayPal request failed before a response was received.",
-            }
+        if _isSalesVolumeRequest(userInput, tool):
+            return await self._salesVolumeAnswer(tool, payload, routedInput)
+
+        result: dict[str, Any] = await self._executeReadTool(tool, payload)
         toolResults: list[dict[str, Any]] = [result]
         return _format_paypal_tool_results([tool], toolResults), {
             "selected_tools": [tool.to_dict()],
@@ -801,6 +967,490 @@ class AgentService:
             ),
             "tool_call_results": toolResults,
         }
+
+    async def _executeReadTool(
+        self,
+        tool: ApiTool,
+        payload: ToolCallInput,
+    ) -> dict[str, Any]:
+        try:
+            return await self.paypal_client.execute(tool, payload)
+        except ClientInputError as error:
+            return {
+                "status": "rejected",
+                "status_code": None,
+                "request_sent": False,
+                "tool": tool.to_dict(),
+                "error": str(error),
+            }
+        except httpx.TimeoutException:
+            return {
+                "status": "client_error",
+                "status_code": None,
+                "tool": tool.to_dict(),
+                "error": "PayPal request timed out.",
+            }
+        except httpx.RequestError:
+            return {
+                "status": "client_error",
+                "status_code": None,
+                "tool": tool.to_dict(),
+                "error": "PayPal request failed before a response was received.",
+            }
+
+    async def _salesVolumeAnswer(
+        self,
+        tool: ApiTool,
+        payload: ToolCallInput,
+        routedInput: RoutedToolInput,
+    ) -> tuple[str, dict[str, Any]]:
+        totalsByCurrency: dict[str, Decimal] = {}
+        totalsByEvent: dict[tuple[str, str], Decimal] = {}
+        statusCounts: dict[str, int] = {}
+        scannedCount: int = 0
+        includedCount: int = 0
+        invalidCount: int = 0
+        pageNumber: int = 1
+        pagesRetrieved: int = 0
+        firstRequest: dict[str, Any] | None = None
+        lastDebugId: str | None = None
+        lastRefreshed: str | None = None
+        refreshMetadataPresent: bool | None = None
+        reportedTotalItems: int | None = None
+        reportedTotalPages: int | None = None
+        seenPageFingerprints: set[str] = set()
+        while True:
+            pagePayload: ToolCallInput = payload.model_copy(
+                update={
+                    "query": {
+                        **payload.query,
+                        "page": pageNumber,
+                        "page_size": TRANSACTION_AGGREGATION_PAGE_SIZE,
+                    }
+                }
+            )
+            pageResult: dict[str, Any] = await self._executeReadTool(
+                tool,
+                pagePayload,
+            )
+            if pageResult.get("status") != "success":
+                pageResult["message"] = (
+                    "The transaction-volume calculation is incomplete because "
+                    f"PayPal page {pageNumber} failed."
+                )
+                return _aggregationFailure(tool, routedInput, pageResult)
+
+            response: Any = pageResult.get("response")
+            if not isinstance(response, dict):
+                invalidResult: dict[str, Any] = _invalidAggregationResult(
+                    tool,
+                    pageResult,
+                    "PayPal returned a non-object transaction response.",
+                )
+                return _aggregationFailure(tool, routedInput, invalidResult)
+            transactionDetails: Any = response.get("transaction_details")
+            if not isinstance(transactionDetails, list):
+                invalidResult = _invalidAggregationResult(
+                    tool,
+                    pageResult,
+                    "PayPal returned invalid transaction_details.",
+                )
+                return _aggregationFailure(tool, routedInput, invalidResult)
+            try:
+                totalItems, totalPages = _transactionPageMetadata(
+                    response,
+                    requestedPage=pageNumber,
+                )
+            except ValueError as error:
+                invalidResult = _invalidAggregationResult(
+                    tool,
+                    pageResult,
+                    str(error),
+                )
+                return _aggregationFailure(tool, routedInput, invalidResult)
+            if (
+                reportedTotalItems is not None
+                and totalItems is not None
+                and reportedTotalItems != totalItems
+            ):
+                invalidResult = _invalidAggregationResult(
+                    tool,
+                    pageResult,
+                    "PayPal changed total_items during pagination.",
+                )
+                return _aggregationFailure(tool, routedInput, invalidResult)
+            if (
+                reportedTotalPages is not None
+                and totalPages is not None
+                and reportedTotalPages != totalPages
+            ):
+                invalidResult = _invalidAggregationResult(
+                    tool,
+                    pageResult,
+                    "PayPal changed total_pages during pagination.",
+                )
+                return _aggregationFailure(tool, routedInput, invalidResult)
+            if reportedTotalItems is None:
+                reportedTotalItems = totalItems
+            if reportedTotalPages is None:
+                reportedTotalPages = totalPages
+            pageFingerprint: str = _transactionPageFingerprint(transactionDetails)
+            if pageFingerprint in seenPageFingerprints:
+                invalidResult = _invalidAggregationResult(
+                    tool,
+                    pageResult,
+                    "PayPal repeated a transaction page; no total was calculated.",
+                )
+                return _aggregationFailure(tool, routedInput, invalidResult)
+            seenPageFingerprints.add(pageFingerprint)
+
+            pagesRetrieved += 1
+            scannedCount += len(transactionDetails)
+            if firstRequest is None and isinstance(pageResult.get("request"), dict):
+                firstRequest = pageResult["request"]
+            debugId: str | None = _paypal_debug_id(pageResult)
+            if debugId:
+                lastDebugId = debugId
+            try:
+                lastRefreshed, refreshMetadataPresent = (
+                    _validatedRefreshMarker(
+                        response,
+                        previousMarker=lastRefreshed,
+                        metadataPreviouslyPresent=refreshMetadataPresent,
+                    )
+                )
+            except ValueError as error:
+                invalidResult = _invalidAggregationResult(
+                    tool,
+                    pageResult,
+                    str(error),
+                )
+                return _aggregationFailure(tool, routedInput, invalidResult)
+            pageIncludedCount, pageInvalidCount = _accumulateTransactionPage(
+                transactionDetails,
+                totalsByCurrency,
+                totalsByEvent,
+                statusCounts,
+            )
+            includedCount += pageIncludedCount
+            invalidCount += pageInvalidCount
+
+            if totalPages is not None:
+                hasMorePages: bool = pageNumber < max(totalPages, 1)
+            else:
+                hasMorePages = (
+                    len(transactionDetails) == TRANSACTION_AGGREGATION_PAGE_SIZE
+                )
+            if not hasMorePages:
+                break
+            if scannedCount >= MAX_TRANSACTION_AGGREGATION_RECORDS:
+                invalidResult = _invalidAggregationResult(
+                    tool,
+                    pageResult,
+                    "PayPal pagination exceeded 10,000 records; use a narrower "
+                    "date range for a complete transaction-volume calculation.",
+                )
+                return _aggregationFailure(tool, routedInput, invalidResult)
+            pageNumber += 1
+        summary: dict[str, Any] = {
+            "metric": "completed positive T00xx payment-volume proxy",
+            "complete": invalidCount == 0
+            and (
+                reportedTotalItems is None
+                or reportedTotalItems == scannedCount
+            )
+            and (
+                reportedTotalPages is None
+                or max(reportedTotalPages, 1) == pagesRetrieved
+            ),
+            "totals_by_currency": {
+                currency: _decimalText(amount)
+                for currency, amount in sorted(totalsByCurrency.items())
+            },
+            "totals_by_event_code": {
+                f"{currency}:{eventCode}": _decimalText(amount)
+                for (currency, eventCode), amount in sorted(totalsByEvent.items())
+            },
+            "included_transaction_count": includedCount,
+            "scanned_transaction_count": scannedCount,
+            "reported_transaction_count": reportedTotalItems,
+            "reported_page_count": reportedTotalPages,
+            "invalid_transaction_count": invalidCount,
+            "status_counts": dict(sorted(statusCounts.items())),
+            "pages_retrieved": pagesRetrieved,
+            "last_refreshed_datetime": lastRefreshed,
+        }
+        aggregateResult: dict[str, Any] = {
+            "status": "success" if summary["complete"] else "partial",
+            "status_code": 200,
+            "paypal_debug_id": lastDebugId,
+            "tool": tool.to_dict(),
+            "request": firstRequest,
+            "response": summary,
+        }
+        return _formatSalesVolume(summary, payload.query, lastDebugId), {
+            "selected_tools": [tool.to_dict()],
+            "tool_input": routedInput.model_dump(
+                by_alias=True,
+                exclude_none=True,
+            ),
+            "tool_call_results": [aggregateResult],
+        }
+
+
+def _isSalesVolumeRequest(userInput: str, tool: ApiTool) -> bool:
+    if tool.path != TRANSACTION_SEARCH_PATH:
+        return False
+    terms: set[str] = {
+        match.group(0).lower() for match in WORD_PATTERN.finditer(userInput)
+    }
+    asksForSales: bool = bool({"sale", "sales"} & terms)
+    asksForTotal: bool = bool({"total", "volume"} & terms) or (
+        "how much" in userInput.lower()
+    )
+    return asksForSales and asksForTotal
+
+
+def _transactionAggregationValues(
+    transaction: Any,
+) -> tuple[str, str, str, Decimal] | None:
+    if not isinstance(transaction, dict):
+        return None
+    transactionInfo: Any = transaction.get("transaction_info")
+    if not isinstance(transactionInfo, dict):
+        return None
+    amountValue: Any = transactionInfo.get("transaction_amount")
+    if not isinstance(amountValue, dict):
+        return None
+    rawCurrency: Any = amountValue.get("currency_code")
+    rawAmount: Any = amountValue.get("value")
+    rawEventCode: Any = transactionInfo.get("transaction_event_code")
+    rawStatus: Any = transactionInfo.get("transaction_status")
+    if not all(
+        isinstance(value, str)
+        for value in (rawCurrency, rawAmount, rawEventCode, rawStatus)
+    ):
+        return None
+    currency: str = rawCurrency.upper()
+    eventCode: str = rawEventCode.upper()
+    status: str = rawStatus.upper()
+    if not CURRENCY_CODE_PATTERN.fullmatch(currency):
+        return None
+    try:
+        amount: Decimal = Decimal(rawAmount)
+    except InvalidOperation:
+        return None
+    if not amount.is_finite():
+        return None
+    return currency, eventCode, status, amount
+
+
+def _accumulateTransactionPage(
+    transactionDetails: list[Any],
+    totalsByCurrency: dict[str, Decimal],
+    totalsByEvent: dict[tuple[str, str], Decimal],
+    statusCounts: dict[str, int],
+) -> tuple[int, int]:
+    includedCount: int = 0
+    invalidCount: int = 0
+    for transaction in transactionDetails:
+        aggregation: tuple[str, str, str, Decimal] | None = (
+            _transactionAggregationValues(transaction)
+        )
+        if aggregation is None:
+            invalidCount += 1
+            continue
+        currency, eventCode, status, amount = aggregation
+        statusCounts[status] = statusCounts.get(status, 0) + 1
+        if (
+            status != "S"
+            or not PAYMENT_EVENT_CODE_PATTERN.fullmatch(eventCode)
+            or amount <= 0
+        ):
+            continue
+        totalsByCurrency[currency] = (
+            totalsByCurrency.get(currency, Decimal("0")) + amount
+        )
+        eventKey: tuple[str, str] = (currency, eventCode)
+        totalsByEvent[eventKey] = (
+            totalsByEvent.get(eventKey, Decimal("0")) + amount
+        )
+        includedCount += 1
+    return includedCount, invalidCount
+
+
+def _validatedRefreshMarker(
+    response: dict[str, Any],
+    *,
+    previousMarker: str | None,
+    metadataPreviouslyPresent: bool | None,
+) -> tuple[str | None, bool]:
+    metadataPresent: bool = "last_refreshed_datetime" in response
+    if (
+        metadataPreviouslyPresent is not None
+        and metadataPreviouslyPresent != metadataPresent
+    ):
+        raise ValueError("PayPal changed refresh metadata during pagination.")
+    marker: Any = response.get("last_refreshed_datetime")
+    if metadataPresent and not isinstance(marker, str):
+        raise ValueError(
+            "PayPal returned invalid last_refreshed_datetime metadata."
+        )
+    if isinstance(marker, str):
+        if previousMarker is not None and previousMarker != marker:
+            raise ValueError(
+                "PayPal refreshed the report during pagination; no total was "
+                "calculated."
+            )
+        return marker, metadataPresent
+    return previousMarker, metadataPresent
+
+
+def _nonNegativeInteger(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _transactionPageMetadata(
+    response: dict[str, Any],
+    *,
+    requestedPage: int,
+) -> tuple[int | None, int | None]:
+    responsePage: int | None = _nonNegativeInteger(response.get("page"))
+    if "page" in response and responsePage is None:
+        raise ValueError("PayPal returned invalid transaction page metadata.")
+    if responsePage is not None and responsePage != requestedPage:
+        raise ValueError("PayPal returned an unexpected transaction page.")
+
+    totalItems: int | None = _nonNegativeInteger(response.get("total_items"))
+    totalPages: int | None = _nonNegativeInteger(response.get("total_pages"))
+    if "total_items" in response and totalItems is None:
+        raise ValueError("PayPal returned invalid total_items metadata.")
+    if "total_pages" in response and totalPages is None:
+        raise ValueError("PayPal returned invalid total_pages metadata.")
+    if (
+        totalItems is not None
+        and totalItems > MAX_TRANSACTION_AGGREGATION_RECORDS
+    ):
+        raise ValueError(
+            "PayPal found more than 10,000 records; use a narrower date range "
+            "for a complete transaction-volume calculation."
+        )
+    if (
+        totalPages is not None
+        and totalPages > MAX_TRANSACTION_AGGREGATION_PAGES
+    ):
+        raise ValueError(
+            "PayPal reported more than 20 pages; use a narrower date range "
+            "for a complete transaction-volume calculation."
+        )
+    return totalItems, totalPages
+
+
+def _transactionPageFingerprint(transactionDetails: list[Any]) -> str:
+    serializedDetails: str = json.dumps(
+        transactionDetails,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(serializedDetails.encode("utf-8")).hexdigest()
+
+
+def _invalidAggregationResult(
+    tool: ApiTool,
+    pageResult: dict[str, Any],
+    error: str,
+) -> dict[str, Any]:
+    return {
+        "status": "invalid_response",
+        "status_code": pageResult.get("status_code"),
+        "paypal_debug_id": _paypal_debug_id(pageResult),
+        "request_sent": True,
+        "tool": tool.to_dict(),
+        "request": pageResult.get("request"),
+        "error": error,
+    }
+
+
+def _aggregationFailure(
+    tool: ApiTool,
+    routedInput: RoutedToolInput,
+    result: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    return _format_paypal_tool_results([tool], [result]), {
+        "selected_tools": [tool.to_dict()],
+        "tool_input": routedInput.model_dump(
+            by_alias=True,
+            exclude_none=True,
+        ),
+        "tool_call_results": [result],
+    }
+
+
+def _decimalText(value: Decimal) -> str:
+    return format(value, "f")
+
+
+def _formatSalesVolume(
+    summary: dict[str, Any],
+    query: dict[str, Any],
+    paypalDebugId: str | None,
+) -> str:
+    completeness: str = "Complete" if summary["complete"] else "Partial"
+    lines: list[str] = [
+        completeness
+        + " PayPal completed-positive-payment volume proxy "
+        + f"from {query.get('start_date')} to {query.get('end_date')}:"
+    ]
+    totals: Any = summary.get("totals_by_currency")
+    if isinstance(totals, dict) and totals:
+        lines.extend(
+            f"- {currency} {amount}"
+            for currency, amount in sorted(totals.items())
+        )
+    else:
+        lines.append("- No qualifying completed positive payments found.")
+    eventTotals: Any = summary.get("totals_by_event_code")
+    if isinstance(eventTotals, dict) and eventTotals:
+        lines.append(
+            "Event-code breakdown: "
+            + ", ".join(
+                f"{key}={amount}"
+                for key, amount in sorted(eventTotals.items())
+            )
+        )
+    lines.append(
+        "Included "
+        + str(summary.get("included_transaction_count", 0))
+        + " of "
+        + str(summary.get("scanned_transaction_count", 0))
+        + " records across "
+        + str(summary.get("pages_retrieved", 0))
+        + " page(s)."
+    )
+    lines.append(
+        "Definition: status S, positive transaction amount, and T00xx payment "
+        "event code. Totals stay separate by currency. This is a transaction-"
+        "volume proxy, not accounting revenue; refunds, reversals, fees, "
+        "non-payment events, and non-positive amounts are excluded."
+    )
+    lines.append("PayPal reports can lag by up to three hours.")
+    refreshedValue: Any = summary.get("last_refreshed_datetime")
+    if isinstance(refreshedValue, str):
+        lines.append(f"last_refreshed_datetime={refreshedValue}")
+    if paypalDebugId:
+        lines.append(f"paypal_debug_id={paypalDebugId}")
+    return "\n".join(lines)
+
+
+def _boundedPendingInput(value: str) -> str:
+    if len(value) <= MAX_PENDING_INPUT_CHARS:
+        return value
+    marker: str = "\n...[context truncated]...\n"
+    retainedChars: int = (MAX_PENDING_INPUT_CHARS - len(marker)) // 2
+    return value[:retainedChars] + marker + value[-retainedChars:]
 
 
 def _memory_query(user_input: str, *, command: str) -> str:
@@ -870,7 +1520,7 @@ def _format_paypal_tool_results(
             )
         if "response" in result:
             lines.append(
-                "  response="
+                "  response_summary="
                 + json.dumps(
                     _bounded_paypal_value(result.get("response")),
                     ensure_ascii=False,
@@ -907,7 +1557,13 @@ def _bounded_paypal_value(
     if depth >= 6:
         return "...[nested response truncated]"
     if isinstance(value, dict):
-        items = list(value.items())
+        items: list[tuple[Any, Any]] = []
+        for key, child in value.items():
+            if str(key).lower() == "links":
+                child = _usefulPaypalLinks(child)
+                if not child:
+                    continue
+            items.append((key, child))
         bounded = {
             str(key): _bounded_paypal_value(child, depth=depth + 1)
             for key, child in items[:40]
@@ -917,14 +1573,29 @@ def _bounded_paypal_value(
         return bounded
     if isinstance(value, list):
         boundedList = [
-            _bounded_paypal_value(child, depth=depth + 1) for child in value[:10]
+            _bounded_paypal_value(child, depth=depth + 1)
+            for child in value[:MAX_RESPONSE_LIST_ITEMS]
         ]
-        if len(value) > 10:
-            boundedList.append(f"...{len(value) - 10} items omitted")
+        if len(value) > MAX_RESPONSE_LIST_ITEMS:
+            boundedList.append(
+                f"...{len(value) - MAX_RESPONSE_LIST_ITEMS} items omitted"
+            )
         return boundedList
-    if isinstance(value, str) and len(value) > 1000:
-        return value[:1000] + "...[truncated]"
+    if isinstance(value, str) and len(value) > MAX_RESPONSE_STRING_CHARS:
+        return value[:MAX_RESPONSE_STRING_CHARS] + "...[truncated]"
     return value
+
+
+def _usefulPaypalLinks(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    navigationRelations: set[str] = {"first", "last", "next", "self"}
+    return [
+        link
+        for link in value
+        if isinstance(link, dict)
+        and str(link.get("rel", "")).lower() not in navigationRelations
+    ]
 
 
 def _mutationBodyIsMissing(tool: ApiTool, body: Any) -> bool:
