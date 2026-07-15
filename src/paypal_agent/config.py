@@ -26,12 +26,9 @@ class Settings(BaseSettings):
     paypal_postman_collection_path: Path = Field(
         default_factory=defaultPostmanCollectionPath
     )
-    max_selected_tools: int = Field(default=12, ge=1, le=50)
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     model_provider: ModelProvider = "bedrock"
-    model_router_enabled: bool | None = None
     aws_region: str = "us-east-1"
-    bedrock_router_enabled: bool = True
     bedrock_router_model_id: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
     bedrock_main_model_id: str = "us.anthropic.claude-opus-4-6-v1"
     bedrock_subagent_model_id: str = "us.anthropic.claude-opus-4-6-v1"
@@ -74,12 +71,6 @@ class Settings(BaseSettings):
         if self.paypal_environment == "live":
             return "https://api-m.paypal.com"
         return "https://api-m.sandbox.paypal.com"
-
-    @property
-    def router_enabled(self) -> bool:
-        if self.model_router_enabled is not None:
-            return self.model_router_enabled
-        return self.bedrock_router_enabled
 
     @property
     def router_model_id(self) -> str:

@@ -21,13 +21,11 @@ from paypal_agent.config import Settings, settings
 from paypal_agent.hybrid_rag import HybridRagPipeline
 from paypal_agent.local_memory import LocalMemoryStore
 from paypal_agent.model_router import (
-    SUPPORT_TOOL_NAMES,
     BedrockRuntimeClient,
     RoutedToolInput,
     RouterDecision,
     RouteResult,
     SmallModelRouter,
-    _fallback_decision,
     missingInputMessage,
 )
 from paypal_agent.package_assets import (
@@ -40,7 +38,11 @@ from paypal_agent.paypal_client import (
     ToolCallInput,
 )
 from paypal_agent.postman import ApiTool
-from paypal_agent.system_search import RequestLog, SystemSearch
+from paypal_agent.system_search import (
+    RequestLog,
+    SystemSearch,
+    _isFullCatalogRequest,
+)
 from paypal_agent.tool_registry import ToolRegistry
 from paypal_agent.tracing import traceRun
 
@@ -53,7 +55,6 @@ GraphRoute = Literal[
     "paypal",
 ]
 GraphNodeName = Literal[
-    "shortlist_tools",
     "route_request",
     "run_rag_tool",
     "run_system_search",
@@ -87,7 +88,6 @@ class ChatGraphState(TypedDict):
     user_input: str
     routing_input: str
     conversation_id: str
-    candidates: NotRequired[list[ApiTool]]
     route_result: NotRequired[RouteResult]
     fallback_answer: NotRequired[str]
     route_payload: NotRequired[dict[str, Any]]
@@ -306,11 +306,8 @@ class AgentService:
             )
             if pendingRequest is None:
                 return userInput
-            previousInput, pendingToolName, _expiresAt = pendingRequest
+            previousInput: str = pendingRequest[0]
             self.pending_requests.move_to_end(conversationId)
-            if self._startsNewRequest(userInput, pendingToolName):
-                self.pending_requests.pop(conversationId, None)
-                return userInput
         combinedInput: str = (
             "Previous unresolved PayPal request:\n"
             + previousInput
@@ -319,24 +316,8 @@ class AgentService:
         )
         return _boundedPendingInput(combinedInput)
 
-    def _startsNewRequest(self, userInput: str, pendingToolName: str) -> bool:
-        candidates: list[ApiTool] = self.registry.search(
-            userInput,
-            limit=self.settings.max_selected_tools,
-        )
-        independentDecision: RouterDecision = _fallback_decision(
-            userInput,
-            candidates,
-        )
-        if independentDecision.intent in SUPPORT_TOOL_NAMES:
-            return True
-        if independentDecision.intent == "paypal_tool":
-            return independentDecision.selected_tool_names != [pendingToolName]
-        return False
-
     def _build_chat_graph(self) -> Any:
         graph = StateGraph(ChatGraphState)
-        graph.add_node("shortlist_tools", self._graph_shortlist_tools)
         graph.add_node("route_request", self._graph_route_request)
         graph.add_node("run_rag_tool", self._graph_run_rag_tool)
         graph.add_node("run_system_search", self._graph_run_system_search)
@@ -347,8 +328,7 @@ class AgentService:
         graph.add_node("orchestrate_answer", self._graph_orchestrate_answer)
         graph.add_node("record_request", self._graph_record_request)
 
-        graph.add_edge(START, "shortlist_tools")
-        graph.add_edge("shortlist_tools", "route_request")
+        graph.add_edge(START, "route_request")
         graph.add_conditional_edges(
             "route_request",
             self._graph_route_key,
@@ -371,19 +351,12 @@ class AgentService:
         graph.add_edge("record_request", END)
         return graph.compile(name="paypal_agent_chat_graph")
 
-    def _graph_shortlist_tools(
-        self,
-        state: ChatGraphState,
-    ) -> dict[str, list[ApiTool]]:
-        return {"candidates": self._shortlist_tools(state["routing_input"])}
-
     async def _graph_route_request(
         self,
         state: ChatGraphState,
     ) -> dict[str, RouteResult]:
         routeResult: RouteResult = await self._route_request(
             state["routing_input"],
-            self._state_candidates(state),
         )
         return {
             "route_result": self._requireMutationBody(routeResult),
@@ -471,10 +444,8 @@ class AgentService:
     ) -> dict[str, Any]:
         routeResult: RouteResult = self._state_route_result(state)
         decision: RouterDecision = routeResult.decision
-        if routeResult.mode == "deterministic_multi_step":
-            fallbackAnswer: str = decision.user_message
-        elif decision.intent == "paypal_tool" and decision.missing_inputs:
-            fallbackAnswer = missingInputMessage(decision.missing_inputs)
+        if decision.intent == "paypal_tool" and decision.missing_inputs:
+            fallbackAnswer: str = missingInputMessage(decision.missing_inputs)
         else:
             fallbackAnswer = (
                 "I could not safely verify one exact PayPal request. Please "
@@ -515,8 +486,7 @@ class AgentService:
         self,
         state: ChatGraphState,
     ) -> dict[str, dict[str, Any]]:
-        routeResult = self._state_route_result(state)
-        candidates = self._state_candidates(state)
+        routeResult: RouteResult = self._state_route_result(state)
         self._updatePendingRequest(state, routeResult)
         self.request_log.append(
             {
@@ -563,7 +533,6 @@ class AgentService:
                 "metadata": {
                     "router_mode": routeResult.mode,
                     "router_error": routeResult.error,
-                    "candidate_tools": [tool.to_dict() for tool in candidates],
                     "tool_count": len(self.registry.tools),
                     "orchestration": "langgraph",
                     "graph": "paypal_agent_chat_graph",
@@ -607,9 +576,6 @@ class AgentService:
         for conversationId in expiredConversationIds:
             self.pending_requests.pop(conversationId, None)
 
-    def _state_candidates(self, state: ChatGraphState) -> list[ApiTool]:
-        return cast(list[ApiTool], state.get("candidates", []))
-
     def _state_route_result(self, state: ChatGraphState) -> RouteResult:
         routeResult = state.get("route_result")
         if routeResult is None:
@@ -625,40 +591,16 @@ class AgentService:
     def _state_answer(self, state: ChatGraphState) -> str:
         return str(state.get("answer", ""))
 
-    def _shortlist_tools(self, user_input: str) -> list[ApiTool]:
-        with traceRun(
-            self.settings,
-            "tool_registry_shortlist",
-            "retriever",
-            inputs={
-                "query_length": len(user_input),
-                "limit": self.settings.max_selected_tools,
-            },
-            tags=["router", "shortlist"],
-        ) as trace:
-            candidates = self.registry.search(
-                user_input,
-                limit=self.settings.max_selected_tools,
-            )
-            trace.end(
-                {
-                    "candidate_tool_names": [tool.tool_name for tool in candidates],
-                    "candidate_count": len(candidates),
-                }
-            )
-            return candidates
-
     async def _route_request(
         self,
-        user_input: str,
-        candidates: list[ApiTool],
+        userInput: str,
     ) -> RouteResult:
         with traceRun(
             self.settings,
             "small_model_router",
             inputs={
-                "user_input_length": len(user_input),
-                "candidate_tool_names": [tool.tool_name for tool in candidates],
+                "user_input_length": len(userInput),
+                "available_tool_count": len(self.registry.tools),
             },
             metadata={
                 "model_provider": self.settings.model_provider,
@@ -666,17 +608,22 @@ class AgentService:
             },
             tags=["router"],
         ) as trace:
-            route_result = await self.router.route(user_input, candidates)
+            routeResult: RouteResult = await self.router.route(
+                userInput,
+                self.registry.tools,
+            )
             trace.end(
                 {
-                    "intent": route_result.decision.intent,
-                    "selected_tool_names": (route_result.decision.selected_tool_names),
-                    "missing_input_names": route_result.decision.missing_inputs,
-                    "mode": route_result.mode,
-                    "has_error": route_result.error is not None,
+                    "intent": routeResult.decision.intent,
+                    "selected_tool_names": (
+                        routeResult.decision.selected_tool_names
+                    ),
+                    "missing_input_names": routeResult.decision.missing_inputs,
+                    "mode": routeResult.mode,
+                    "has_error": routeResult.error is not None,
                 }
             )
-            return route_result
+            return routeResult
 
     async def _orchestrate_answer(
         self,
@@ -828,7 +775,14 @@ class AgentService:
             inputs={"query_length": len(user_input)},
             tags=["system-search"],
         ) as trace:
-            result = self.system_search.search(user_input)
+            isFullCatalog: bool = _isFullCatalogRequest(user_input)
+            searchLimit: int = (
+                len(self.registry.tools) if isFullCatalog else 10
+            )
+            result: dict[str, Any] = self.system_search.search(
+                user_input,
+                limit=searchLimit,
+            )
             trace.end(
                 {
                     "matching_tool_count": len(result["matching_tools"]),
@@ -836,9 +790,16 @@ class AgentService:
                 }
             )
             answerLines: list[str] = []
-            matchingTools: list[dict[str, Any]] = result["matching_tools"][:8]
+            matchingTools: list[dict[str, Any]] = result["matching_tools"]
+            if not isFullCatalog:
+                matchingTools = matchingTools[:8]
             if matchingTools:
-                answerLines.append("Matching PayPal tools:")
+                if isFullCatalog:
+                    answerLines.append(
+                        f"All {len(matchingTools)} PayPal API tools:"
+                    )
+                else:
+                    answerLines.append("Matching PayPal tools:")
                 answerLines.extend(
                     "- "
                     + str(tool["display_name"])

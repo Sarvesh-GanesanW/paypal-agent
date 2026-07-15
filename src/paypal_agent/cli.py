@@ -43,7 +43,6 @@ class CliState:
     settings: Settings
     service: AgentService
     conversation_id: str
-    deterministic: bool
     no_stream: bool
     no_color: bool
 
@@ -80,11 +79,6 @@ def _parseArgs() -> argparse.Namespace:
         help="use `codex login --device-auth` with --login-codex",
     )
     parser.add_argument(
-        "--deterministic",
-        action="store_true",
-        help="disable model routing/orchestration for local smoke checks",
-    )
-    parser.add_argument(
         "--no-stream",
         action="store_true",
         help="print the final response without streaming graph progress",
@@ -99,8 +93,6 @@ def _buildSettings(args: argparse.Namespace) -> Settings:
         overrides["model_provider"] = args.provider
         if args.save_provider:
             setProvider(args.provider)
-    if args.deterministic:
-        overrides["model_router_enabled"] = False
     return Settings(**overrides)
 
 
@@ -109,7 +101,6 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
         settings=settings,
         service=AgentService(settings),
         conversation_id=args.conversation_id,
-        deterministic=args.deterministic,
         no_stream=args.no_stream,
         no_color=args.no_color,
     )
@@ -175,7 +166,7 @@ async def _handleInput(
         print(_formatMemory("memory find", matches, no_color=state.no_color))
         return
 
-    if state.deterministic or state.no_stream:
+    if state.no_stream:
         result = await state.service.chat(userInput, state.conversation_id)
         print(formatChatResult(result, no_color=state.no_color))
         return
@@ -224,8 +215,6 @@ def _handleProviderCommand(state: CliState, userInput: str) -> None:
         return
     setProvider(cast(ModelProvider, provider))
     overrides = settingsOverrides()
-    if state.deterministic:
-        overrides["model_router_enabled"] = False
     state.settings = Settings(**overrides)
     state.service = AgentService(state.settings)
     print(f"provider={state.settings.model_provider} saved to {CONFIG_PATH}")

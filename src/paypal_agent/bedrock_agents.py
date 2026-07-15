@@ -33,8 +33,6 @@ class BedrockAgentStack:
         route_payload: dict[str, Any],
         fallback_answer: str,
     ) -> str:
-        if not self.settings.router_enabled:
-            return fallback_answer
         decision = route_result.decision
         if (
             route_result.error

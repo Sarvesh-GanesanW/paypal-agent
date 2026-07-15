@@ -53,6 +53,9 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = [".", "src"]
 
+[tool.pyright]
+exclude = [".venv", "build", "dist", "node_modules"]
+
 [tool.ruff]
 line-length = 88
 target-version = "py311"

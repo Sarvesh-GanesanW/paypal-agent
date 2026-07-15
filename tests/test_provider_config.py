@@ -159,7 +159,6 @@ def test_empty_optional_environment_values_are_ignored(
 ) -> None:
     monkeypatch.setenv("PAYPAL_ACCESS_TOKEN", "")
     monkeypatch.setenv("PAYPAL_UPLOAD_ROOT", "")
-    monkeypatch.setenv("MODEL_ROUTER_ENABLED", "")
 
     appSettings: Settings = Settings(
         _env_file=None  # pyright: ignore[reportCallIssue]
@@ -167,7 +166,6 @@ def test_empty_optional_environment_values_are_ignored(
 
     assert appSettings.paypal_access_token is None
     assert appSettings.paypal_upload_root is None
-    assert appSettings.model_router_enabled is None
 
 
 def test_default_relative_postman_path_falls_back_to_package(

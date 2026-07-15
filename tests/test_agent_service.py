@@ -12,9 +12,109 @@ import pytest
 
 from paypal_agent.agent_service import AgentService
 from paypal_agent.config import Settings
-from paypal_agent.model_router import RoutedToolInput, RouterDecision, RouteResult
+from paypal_agent.model_router import (
+    RoutedToolInput,
+    RouterDecision,
+    RouteResult,
+    SmallModelRouter,
+)
 from paypal_agent.paypal_client import ToolCallInput
-from paypal_agent.system_search import RequestLog
+from paypal_agent.postman import ApiTool
+from paypal_agent.system_search import RequestLog, _isFullCatalogRequest
+
+
+def _paypalDecision(toolName: str) -> RouterDecision:
+    return RouterDecision(
+        intent="paypal_tool",
+        selected_tool_names=[toolName],
+        tool_input=RoutedToolInput(),
+        missing_inputs=[],
+        user_message="selected",
+        confidence=0.95,
+    )
+
+
+def _fakeModelDecision(
+    _router: SmallModelRouter,
+    userInput: str,
+    _availableTools: list[ApiTool],
+) -> RouterDecision:
+    latestInput: str = userInput.rsplit("Latest user message:\n", 1)[-1]
+    latestText: str = latestInput.lower()
+    fullText: str = userInput.lower()
+
+    if "what all tools" in latestText or "tools are available" in latestText:
+        return RouterDecision(
+            intent="system_search",
+            selected_tool_names=["system_search"],
+            tool_input=None,
+            missing_inputs=[],
+            user_message="selected",
+            confidence=0.95,
+        )
+    if "remember" in latestText:
+        return RouterDecision(
+            intent="memory_find",
+            selected_tool_names=["memory_find"],
+            tool_input=None,
+            missing_inputs=[],
+            user_message="selected",
+            confidence=0.95,
+        )
+    if "list paypal products" in latestText:
+        return _paypalDecision(
+            "paypal_subscriptions_catalog_products_list_products"
+        )
+    if "show product details" in latestText:
+        return _paypalDecision(
+            "paypal_subscriptions_catalog_products_show_product_details"
+        )
+    if "sales volume" in latestText:
+        return _paypalDecision(
+            "paypal_transaction_search_list_transactions"
+        )
+    if "list transactions" in latestText:
+        return _paypalDecision(
+            "paypal_transaction_search_list_transactions"
+        )
+    if "account balances" in latestText or "balanc check" in latestText:
+        return _paypalDecision(
+            "paypal_transaction_search_list_all_balances"
+        )
+    if "create order" in latestText:
+        return _paypalDecision("paypal_orders_create_order")
+    if "show invoice details" in latestText:
+        return _paypalDecision(
+            "paypal_invoices_invoices_show_invoice_details"
+        )
+    if "send invoice" in latestText or "send an invoice" in latestText:
+        return _paypalDecision(
+            "paypal_invoices_invoices_send_invoice"
+        )
+    if "show order" in latestText or "what order id" in latestText:
+        return _paypalDecision("paypal_orders_show_order_details")
+    if (
+        "previous unresolved paypal request" in fullText
+        and "order id" in latestText
+    ):
+        return _paypalDecision("paypal_orders_show_order_details")
+    return RouterDecision(
+        intent="clarify",
+        selected_tool_names=[],
+        tool_input=None,
+        missing_inputs=[],
+        user_message="clarify",
+        confidence=0.3,
+    )
+
+
+@pytest.fixture(autouse=True)
+def fakeModelRouter(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        SmallModelRouter,
+        "_route_with_provider",
+        _fakeModelDecision,
+    )
 
 
 @pytest.mark.asyncio
@@ -39,7 +139,7 @@ async def test_chat_calls_exact_order_endpoint_and_returns_details(
         service = AgentService(test_settings, paypal_http_client=client)
         result = await service.chat("Show order ORDER-123", "test-thread")
 
-    assert result["metadata"]["router_mode"] == "deterministic"
+    assert result["metadata"]["router_mode"] == "bedrock"
     assert result["metadata"]["orchestration"] == "langgraph"
     assert result["metadata"]["graph"] == "paypal_agent_chat_graph"
     assert result["router_decision"]["intent"] == "paypal_tool"
@@ -146,6 +246,39 @@ async def test_chat_missing_order_id_makes_no_request(
     assert "order_id" in result["answer"]
 
 
+@pytest.mark.parametrize(
+    "userInput",
+    [
+        "What order id do I need?",
+        "What order id should-I use?",
+        "What order id 2 use?",
+    ],
+)
+@pytest.mark.asyncio
+async def test_chat_does_not_treat_ordinary_word_as_order_id(
+    test_settings: Settings,
+    userInput: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+        result = await service.chat(
+            userInput,
+            "ordinary-word-id-thread",
+        )
+
+    assert requests == []
+    assert result["router_decision"]["missing_inputs"] == ["order_id"]
+    assert result["router_decision"]["tool_input"]["path_params"] == {}
+
+
 @pytest.mark.asyncio
 async def test_chat_missing_input_does_not_echo_provider_message(
     test_settings: Settings,
@@ -200,6 +333,42 @@ async def test_chat_uses_pending_request_for_follow_up_id(
     assert requests[0].method == "GET"
     assert requests[0].url.path == "/v2/checkout/orders/TEST-ORDER-123"
     assert secondResult["selected_tool_names"] == ["paypal_orders_show_order_details"]
+
+
+@pytest.mark.asyncio
+async def test_new_request_id_wins_over_pending_request_id(
+    test_settings: Settings,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "INV2-NEW"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+        firstResult = await service.chat(
+            "Send invoice with invoice ID INV2-OLD",
+            "new-invoice-id-thread",
+        )
+        secondResult = await service.chat(
+            "Show invoice details for invoice ID INV2-NEW",
+            "new-invoice-id-thread",
+        )
+
+    assert firstResult["router_decision"]["missing_inputs"] == [
+        "request body"
+    ]
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert requests[0].url.path == (
+        "/v2/invoicing/invoices/INV2-NEW"
+    )
+    assert secondResult["selected_tool_names"] == [
+        "paypal_invoices_invoices_show_invoice_details"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -353,7 +522,7 @@ async def test_same_conversation_requests_are_serialized(
 
         async def routeRequest(
             userInput: str,
-            _candidates: list[Any],
+            _availableTools: list[ApiTool],
         ) -> RouteResult:
             if userInput == "Show order details":
                 firstStarted.set()
@@ -888,6 +1057,7 @@ class FailingBedrockClient:
 @pytest.mark.asyncio
 async def test_chat_provider_error_makes_no_paypal_request(
     test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     requests: list[httpx.Request] = []
 
@@ -895,12 +1065,22 @@ async def test_chat_provider_error_makes_no_paypal_request(
         requests.append(request)
         return httpx.Response(200, json={})
 
-    providerSettings = test_settings.model_copy(update={"model_router_enabled": True})
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         service = AgentService(
-            providerSettings,
+            test_settings,
             paypal_http_client=client,
             bedrock_client=FailingBedrockClient(),
+        )
+        def failProvider(
+            _userInput: str,
+            _availableTools: list[ApiTool],
+        ) -> RouterDecision:
+            raise RuntimeError("router unavailable")
+
+        monkeypatch.setattr(
+            service.router,
+            "_route_with_provider",
+            failProvider,
         )
         result = await service.chat("Show order ORDER-123", "error-thread")
 
@@ -943,10 +1123,7 @@ async def test_answer_models_are_skipped_for_guarded_routes(
     test_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    providerSettings: Settings = test_settings.model_copy(
-        update={"model_router_enabled": True}
-    )
-    service = AgentService(providerSettings)
+    service = AgentService(test_settings)
 
     def failIfCalled(*_args: Any, **_kwargs: Any) -> str:
         raise AssertionError("answer model must not be called")
@@ -1031,9 +1208,9 @@ async def test_answer_models_are_skipped_for_guarded_routes(
             "untrusted user input",
             routeResult,
             routePayload,
-            "safe deterministic fallback",
+            "safe fallback",
         )
-        assert answer == "safe deterministic fallback"
+        assert answer == "safe fallback"
 
 
 @pytest.mark.asyncio
@@ -1202,6 +1379,94 @@ async def test_chat_routes_system_search(test_settings: Settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_lists_complete_tool_catalog(
+    test_settings: Settings,
+) -> None:
+    service = AgentService(test_settings)
+
+    result = await service.chat(
+        "What all tools do you have?",
+        "catalog-thread",
+    )
+
+    answerLines: list[str] = result["answer"].splitlines()
+    toolLines: list[str] = [
+        line for line in answerLines if line.startswith("- ")
+    ]
+    assert answerLines[0] == "All 116 PayPal API tools:"
+    assert len(toolLines) == len(service.registry.tools) == 116
+    assert result["router_decision"]["intent"] == "system_search"
+
+
+@pytest.mark.asyncio
+async def test_chat_keeps_domain_tool_search_bounded(
+    test_settings: Settings,
+) -> None:
+    service = AgentService(test_settings)
+
+    result = await service.chat(
+        "What PayPal tools are available for invoices?",
+        "invoice-catalog-thread",
+    )
+
+    answerLines: list[str] = result["answer"].splitlines()
+    toolLines: list[str] = [
+        line for line in answerLines if line.startswith("- ")
+    ]
+    assert answerLines[0] == "Matching PayPal tools:"
+    assert 1 <= len(toolLines) <= 8
+    assert all("invoic" in line.lower() for line in toolLines)
+
+
+@pytest.mark.parametrize(
+    "userInput",
+    [
+        "List all refund tools",
+        "Which tools can search transactions?",
+        "What all tools do you have for disputes?",
+    ],
+)
+def test_domain_queries_are_not_full_catalog_requests(userInput: str) -> None:
+    assert _isFullCatalogRequest(userInput) is False
+
+
+@pytest.mark.asyncio
+async def test_balance_check_variants_execute_without_sample_query(
+    test_settings: Settings,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"balances": []})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        service = AgentService(test_settings, paypal_http_client=client)
+        firstResult = await service.chat(
+            "Can you check account balances?",
+            "balance-thread",
+        )
+        secondResult = await service.chat(
+            "Please execute the balanc check",
+            "balance-thread",
+        )
+
+    assert len(requests) == 2
+    assert all(request.method == "GET" for request in requests)
+    assert all(
+        request.url.path == "/v1/reporting/balances"
+        for request in requests
+    )
+    assert all(not request.url.query for request in requests)
+    assert firstResult["tool_results"][0]["status_code"] == 200
+    assert secondResult["selected_tool_names"] == [
+        "paypal_transaction_search_list_all_balances"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_chat_writes_local_jsonl_memory(test_settings: Settings) -> None:
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(
@@ -1254,10 +1519,42 @@ async def test_stream_chat_emits_langgraph_nodes(
     ]
     final_events = [event for event in events if event["event"] == "result"]
 
-    assert "shortlist_tools" in node_names
     assert "route_request" in node_names
     assert "run_system_search" in node_names
     assert final_events
     final_result = final_events[-1].get("result")
     assert isinstance(final_result, dict)
     assert final_result["metadata"]["orchestration"] == "langgraph"
+
+
+@pytest.mark.asyncio
+async def test_chat_gives_model_the_complete_tool_catalog(
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service: AgentService = AgentService(test_settings)
+    receivedTools: list[ApiTool] = []
+
+    async def captureTools(
+        _userInput: str,
+        availableTools: list[ApiTool],
+    ) -> RouteResult:
+        receivedTools.extend(availableTools)
+        return RouteResult(
+            decision=RouterDecision(
+                intent="system_search",
+                selected_tool_names=["system_search"],
+                tool_input=None,
+                missing_inputs=[],
+                user_message="selected",
+                confidence=0.95,
+            ),
+            mode="test",
+        )
+
+    monkeypatch.setattr(service.router, "route", captureTools)
+
+    await service.chat("What tools are available?", "catalog-context")
+
+    assert len(receivedTools) == 116
+    assert receivedTools == service.registry.tools

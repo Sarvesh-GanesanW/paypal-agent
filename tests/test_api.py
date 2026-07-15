@@ -21,7 +21,7 @@ def test_health_and_catalog_endpoints() -> None:
     assert client.get("/health").json() == {"status": "healthy"}
     root = client.get("/").json()
     assert root["paypal_tool_count"] == 116
-    assert root["router"] == "small_model_validated_routing"
+    assert root["router"] == "complete_catalog_model_routing"
     assert root["orchestrator"] == "langgraph_state_graph"
     assert root["paypal_environment"] == service.settings.paypal_environment
     assert root["paypal_mutations_enabled"] is service.settings.paypal_allow_mutations
@@ -55,6 +55,22 @@ def test_tool_search_endpoint() -> None:
     assert response.status_code == 200
     tool_names = [tool["tool_name"] for tool in response.json()["tools"]]
     assert "paypal_invoices_invoices_send_invoice" in tool_names
+
+
+def test_system_search_respects_explicit_limit() -> None:
+    client: TestClient = TestClient(app)
+
+    response: httpx.Response = client.get(
+        "/system/search",
+        params={"query": "What all tools do you have?", "limit": 3},
+    )
+
+    assert response.status_code == 200
+    matchingTools: list[dict[str, Any]] = response.json()["matching_tools"]
+    assert len(matchingTools) == 3
+    assert [tool["tool_name"] for tool in matchingTools] == [
+        tool.tool_name for tool in service.registry.tools[:3]
+    ]
 
 
 def test_chat_issues_unique_bearer_conversation_ids(

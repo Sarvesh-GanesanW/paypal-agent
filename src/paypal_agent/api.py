@@ -28,7 +28,7 @@ async def root() -> dict[str, Any]:
         "name": "Datazoic PayPal Agent",
         "status": "healthy",
         "paypal_tool_count": len(service.registry.tools),
-        "router": "small_model_validated_routing",
+        "router": "complete_catalog_model_routing",
         "orchestrator": "langgraph_state_graph",
         "model_provider": service.settings.model_provider,
         "router_model": service.settings.router_model_id,

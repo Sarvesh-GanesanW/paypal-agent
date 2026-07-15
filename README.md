@@ -6,12 +6,12 @@ collection linked in the task PDF.
 ## What This Contains
 
 - 116 PayPal requests loaded into the catalog from the Postman collection.
-- Lexical shortlist routing before model routing.
+- Every routing turn gives the small model all 116 sanitized tool descriptors.
 - Configurable model provider: Bedrock, OpenAI API, Anthropic API, or local
   Codex CLI auth.
 - Small router model at temperature `0` with strict Pydantic output.
-- LangGraph `StateGraph` orchestration for shortlist, routing, RAG/system
-  search branches, PayPal planning, answer generation, and request logging.
+- LangGraph `StateGraph` orchestration for model routing, RAG/system search
+  branches, PayPal planning, answer generation, and request logging.
 - Main orchestrator and sub-agent model for grounded final answers.
 - pgvector hybrid RAG with Bedrock Cohere Embed v4 and Cohere rerank.
 - HNSW and IVFFLAT vector indexes plus a GIN index on `tsvector`.
@@ -28,6 +28,9 @@ required inputs, credentials, and request body are available. Limited-release
 PayPal APIs still require the corresponding PayPal account approval.
 
 ## Setup
+
+For a complete environment and terminal walkthrough, see
+[TUI_GUIDE.md](TUI_GUIDE.md).
 
 ```bash
 uv sync --extra dev
@@ -47,7 +50,6 @@ PAYPAL_MANAGED_ACCESS_TOKEN=
 PAYPAL_UPLOAD_ROOT=
 PAYPAL_ALLOW_MUTATIONS=false
 MODEL_PROVIDER=bedrock
-MODEL_ROUTER_ENABLED=
 AWS_REGION=us-east-1
 BEDROCK_ROUTER_MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0
 BEDROCK_MAIN_MODEL_ID=us.anthropic.claude-opus-4-6-v1
@@ -89,6 +91,11 @@ Set `MODEL_PROVIDER` to one of:
 - `anthropic`: direct Anthropic API calls with `ANTHROPIC_API_KEY`.
 - `codex`: shells out to local `codex exec`, so the Codex CLI can reuse the
   user's ChatGPT/Codex login or API-key login.
+
+Natural-language chat always uses the configured model provider for tool
+selection. The router sends the user request and metadata for all 116 PayPal
+tools in one model call. It doesn't preselect or guess tools from keywords. A
+provider or validation failure returns a clarification without calling PayPal.
 
 The Codex subprocess runs ephemerally from an isolated temporary directory with
 a scrubbed environment and read-only permissions. It is intended for a trusted
