@@ -387,6 +387,7 @@ API tool per turn.
 Use memory_find or memory_grep only when the user explicitly asks to search
 the agent's saved local memory or prior records. Never use a memory tool for a
 general PayPal question or for a request asking which ID or value is needed.
+For every support tool, set tool_input to null.
 
 When previous and latest messages are provided, treat an independent latest
 message as a new request. Use the previous unresolved request only when the
@@ -568,8 +569,7 @@ def _validate_decision(
     if decision.intent in SUPPORT_TOOL_NAMES:
         if decision.selected_tool_names != [decision.intent]:
             raise RouterModelError("Router intent and support tool do not match.")
-        if decision.tool_input is not None:
-            raise RouterModelError("Support tools cannot include PayPal input.")
+        decision.tool_input = None
         decision.missing_inputs = []
         decision.user_message = SUPPORT_TOOL_MESSAGES[decision.intent]
         return

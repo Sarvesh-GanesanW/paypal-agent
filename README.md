@@ -12,7 +12,8 @@ collection linked in the task PDF.
 - Small router model at temperature `0` with strict Pydantic output.
 - LangGraph `StateGraph` orchestration for model routing, RAG/system search
   branches, PayPal planning, answer generation, and request logging.
-- Main orchestrator and sub-agent model for grounded final answers.
+- Every natural-language chat invokes the router, sub-agent, and main
+  orchestrator model through LangGraph.
 - pgvector hybrid RAG with Bedrock Cohere Embed v4 and Cohere rerank.
 - HNSW and IVFFLAT vector indexes plus a GIN index on `tsvector`.
 - System-search support tool over capabilities and recent request logs.
@@ -94,8 +95,10 @@ Set `MODEL_PROVIDER` to one of:
 
 Natural-language chat always uses the configured model provider for tool
 selection. The router sends the user request and metadata for all 116 PayPal
-tools in one model call. It doesn't preselect or guess tools from keywords. A
-provider or validation failure returns a clarification without calling PayPal.
+tools in one model call. It doesn't preselect or guess tools from keywords.
+Every graph branch then invokes the configured sub-agent and main answer model.
+There is no deterministic final-answer fallback; if the answer model is
+unavailable, the chat request fails instead of silently returning non-LLM text.
 
 The Codex subprocess runs ephemerally from an isolated temporary directory with
 a scrubbed environment and read-only permissions. It is intended for a trusted
@@ -152,10 +155,12 @@ curl -X POST http://localhost:8000/chat \
 
 `/chat` calls PayPal only when routing produces one unambiguous read-only tool
 and all IDs, dates, and filters are grounded in the user's request. Missing
-inputs, ambiguity, low confidence, or a model-provider failure returns a
-clarification and makes no PayPal request. A mutating chat request also makes
-no PayPal request; it returns an unconfirmed direct-call payload for the user
-to review. The separate direct caller must add confirmation.
+inputs, ambiguity, low confidence, or a router-model failure enter a
+clarification branch and make no PayPal request. The configured answer models
+still compose that clarification. If those answer models are unavailable, the
+chat request fails. A mutating chat request also makes no PayPal request; it
+returns an unconfirmed direct-call payload for the user to review. The separate
+direct caller must add confirmation.
 
 The first `/chat` response includes a random UUIDv4 `conversationId`. Treat it
 as a bearer session token and send it on follow-up turns. The API no longer
@@ -202,6 +207,9 @@ Helpful terminal commands:
 /quit
 ```
 
+The `/tools`, `/rag`, `/grep`, and `/find` query shortcuts use the same
+LangGraph and answer-model path as normal text.
+
 Local memory is append-only JSONL under `MEMORY_DIR`. PayPal tool events store
 only tool, status, status code, and PayPal Debug ID metadata; PayPal request and
 response bodies, chat prompts, and raw conversation IDs are not written to
@@ -209,10 +217,10 @@ durable JSONL memory. `memory_grep` and `memory_find` return only an explicit
 metadata allowlist, including when they read files created by an older version.
 The in-process recent-request log is also metadata-only. Delete pre-upgrade
 JSONL files under `MEMORY_DIR` if the sensitive values must also be removed from
-disk. Raw PayPal results are returned to the requesting user, but operational
-PayPal responses and mutation plans are rendered deterministically rather than
-sent to an answer model. Optional LangSmith tracing should still be enabled only
-under the operator's data handling policy.
+disk. The configured sub-agent and main answer model receive the prepared
+answer and relevant route payload, including PayPal responses or mutation plans,
+to compose every natural-language chat response. Configure providers and
+optional LangSmith tracing only under the operator's data handling policy.
 
 ## Terminal Demo
 

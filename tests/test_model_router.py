@@ -79,7 +79,12 @@ class FakeSupportBedrockClient:
                                 "input": {
                                     "intent": self.intent,
                                     "selected_tool_names": [self.intent],
-                                    "tool_input": None,
+                                    "tool_input": {
+                                        "pathParams": {"ignored": "value"},
+                                        "query": {"ignored": "value"},
+                                        "body": {"ignored": "value"},
+                                        "headers": {"ignored": "value"},
+                                    },
                                     "missing_inputs": [],
                                     "user_message": "selected",
                                     "confidence": 0.9,
@@ -965,6 +970,7 @@ async def test_model_selects_support_tools(
     assert result.mode == "bedrock"
     assert result.decision.intent == intent
     assert result.decision.selected_tool_names == [intent]
+    assert result.decision.tool_input is None
 
 
 @pytest.mark.asyncio

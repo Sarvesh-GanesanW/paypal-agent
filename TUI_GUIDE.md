@@ -167,6 +167,9 @@ Useful commands inside the TUI:
 /quit
 ```
 
+The `/tools`, `/rag`, `/grep`, and `/find` query shortcuts use the same
+LangGraph router, sub-agent, and main answer model as normal text.
+
 ## 6. Run one query and exit
 
 Use `--once` for scripts and quick checks:
@@ -178,7 +181,16 @@ uv run paypal-agent --provider codex --once \
 
 Natural-language queries require one configured model provider. Each routing
 turn sends that provider the user query and sanitized metadata for all 116
-PayPal tools; there is no keyword-only mode or selection fallback.
+PayPal tools; there is no keyword-only mode or selection fallback. After the
+selected LangGraph branch runs, the configured sub-agent and main model compose
+the final answer from the prepared answer and route payload. There is no
+deterministic final-answer fallback.
+
+The answer models receive relevant PayPal response or mutation-plan data. That
+data can contain account details, balances, customer information, or other PII.
+Use only providers approved by your data-handling policy. Authentication
+headers and literal Postman header/query samples are removed before answer-model
+calls.
 
 ## 7. Verify the setup
 

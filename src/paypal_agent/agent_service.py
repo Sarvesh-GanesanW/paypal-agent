@@ -89,7 +89,7 @@ class ChatGraphState(TypedDict):
     routing_input: str
     conversation_id: str
     route_result: NotRequired[RouteResult]
-    fallback_answer: NotRequired[str]
+    prepared_answer: NotRequired[str]
     route_payload: NotRequired[dict[str, Any]]
     answer: NotRequired[str]
     result: NotRequired[dict[str, Any]]
@@ -414,29 +414,35 @@ class AgentService:
         self,
         state: ChatGraphState,
     ) -> dict[str, Any]:
-        fallbackAnswer, routePayload = self._rag_answer(state["user_input"])
-        return {"fallback_answer": fallbackAnswer, "route_payload": routePayload}
+        preparedAnswer, routePayload = self._rag_answer(state["user_input"])
+        return {"prepared_answer": preparedAnswer, "route_payload": routePayload}
 
     def _graph_run_system_search(
         self,
         state: ChatGraphState,
     ) -> dict[str, Any]:
-        fallbackAnswer, routePayload = self._system_search_answer(state["user_input"])
-        return {"fallback_answer": fallbackAnswer, "route_payload": routePayload}
+        preparedAnswer, routePayload = self._system_search_answer(
+            state["user_input"]
+        )
+        return {"prepared_answer": preparedAnswer, "route_payload": routePayload}
 
     def _graph_run_memory_grep(
         self,
         state: ChatGraphState,
     ) -> dict[str, Any]:
-        fallbackAnswer, routePayload = self._memory_grep_answer(state["user_input"])
-        return {"fallback_answer": fallbackAnswer, "route_payload": routePayload}
+        preparedAnswer, routePayload = self._memory_grep_answer(
+            state["user_input"]
+        )
+        return {"prepared_answer": preparedAnswer, "route_payload": routePayload}
 
     def _graph_run_memory_find(
         self,
         state: ChatGraphState,
     ) -> dict[str, Any]:
-        fallbackAnswer, routePayload = self._memory_find_answer(state["user_input"])
-        return {"fallback_answer": fallbackAnswer, "route_payload": routePayload}
+        preparedAnswer, routePayload = self._memory_find_answer(
+            state["user_input"]
+        )
+        return {"prepared_answer": preparedAnswer, "route_payload": routePayload}
 
     def _graph_prepare_clarification(
         self,
@@ -445,14 +451,14 @@ class AgentService:
         routeResult: RouteResult = self._state_route_result(state)
         decision: RouterDecision = routeResult.decision
         if decision.intent == "paypal_tool" and decision.missing_inputs:
-            fallbackAnswer: str = missingInputMessage(decision.missing_inputs)
+            preparedAnswer: str = missingInputMessage(decision.missing_inputs)
         else:
-            fallbackAnswer = (
+            preparedAnswer = (
                 "I could not safely verify one exact PayPal request. Please "
                 "restate the action with its required IDs, dates, and filters."
             )
         return {
-            "fallback_answer": fallbackAnswer,
+            "prepared_answer": preparedAnswer,
             "route_payload": {
                 "missing_inputs": decision.missing_inputs,
                 "router_decision": decision.model_dump(by_alias=True),
@@ -464,11 +470,11 @@ class AgentService:
         self,
         state: ChatGraphState,
     ) -> dict[str, Any]:
-        fallbackAnswer, routePayload = await self._paypal_answer(
+        preparedAnswer, routePayload = await self._paypal_answer(
             self._state_route_result(state).decision,
             state["routing_input"],
         )
-        return {"fallback_answer": fallbackAnswer, "route_payload": routePayload}
+        return {"prepared_answer": preparedAnswer, "route_payload": routePayload}
 
     async def _graph_orchestrate_answer(
         self,
@@ -478,7 +484,7 @@ class AgentService:
             state["user_input"],
             self._state_route_result(state),
             self._state_route_payload(state),
-            self._state_fallback_answer(state),
+            self._statePreparedAnswer(state),
         )
         return {"answer": answer}
 
@@ -533,6 +539,10 @@ class AgentService:
                 "metadata": {
                     "router_mode": routeResult.mode,
                     "router_error": routeResult.error,
+                    "router_model": self.settings.router_model_id,
+                    "answer_model_used": True,
+                    "answer_model": self.settings.main_model_id,
+                    "subagent_model": self.settings.subagent_model_id,
                     "tool_count": len(self.registry.tools),
                     "orchestration": "langgraph",
                     "graph": "paypal_agent_chat_graph",
@@ -585,8 +595,8 @@ class AgentService:
     def _state_route_payload(self, state: ChatGraphState) -> dict[str, Any]:
         return cast(dict[str, Any], state.get("route_payload", {}))
 
-    def _state_fallback_answer(self, state: ChatGraphState) -> str:
-        return str(state.get("fallback_answer", ""))
+    def _statePreparedAnswer(self, state: ChatGraphState) -> str:
+        return str(state.get("prepared_answer", ""))
 
     def _state_answer(self, state: ChatGraphState) -> str:
         return str(state.get("answer", ""))
@@ -630,7 +640,7 @@ class AgentService:
         user_input: str,
         route_result: RouteResult,
         route_payload: dict[str, Any],
-        fallback_answer: str,
+        prepared_answer: str,
     ) -> str:
         with traceRun(
             self.settings,
@@ -652,9 +662,14 @@ class AgentService:
                 user_input,
                 route_result,
                 route_payload,
-                fallback_answer,
+                prepared_answer,
             )
-            trace.end({"answer_length": len(answer)})
+            trace.end(
+                {
+                    "answer_length": len(answer),
+                    "answer_model_used": True,
+                }
+            )
             return answer
 
     async def call_tool(

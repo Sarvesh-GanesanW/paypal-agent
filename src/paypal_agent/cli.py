@@ -33,6 +33,8 @@ Commands:
   /find <query>     find local JSONL memory by keywords
   /quit             exit
 
+Query commands use the same LangGraph chat and answer-model path as normal text.
+
 Type normal user requests directly, for example:
   I need to send a $50 invoice to buyer@example.com. What do you need from me?
 """
@@ -145,26 +147,6 @@ async def _handleInput(
     if userInput.startswith("/login "):
         await _handleLoginCommand(state, userInput)
         return
-    if userInput.startswith("/tools "):
-        query = userInput.removeprefix("/tools ").strip()
-        tools = state.service.search_tools(query, limit=8)
-        print(_formatTools(tools, no_color=state.no_color))
-        return
-    if userInput.startswith("/rag "):
-        query = userInput.removeprefix("/rag ").strip()
-        result = state.service.rag.search(query, limit=3)
-        print(_formatRag(result, no_color=state.no_color))
-        return
-    if userInput.startswith("/grep "):
-        query = userInput.removeprefix("/grep ").strip()
-        matches = state.service.memory.grep(query, limit=8)
-        print(_formatMemory("memory grep", matches, no_color=state.no_color))
-        return
-    if userInput.startswith("/find "):
-        query = userInput.removeprefix("/find ").strip()
-        matches = state.service.memory.find(query, limit=8)
-        print(_formatMemory("memory find", matches, no_color=state.no_color))
-        return
 
     if state.no_stream:
         result = await state.service.chat(userInput, state.conversation_id)
@@ -273,6 +255,10 @@ def formatRouteSummary(result: dict[str, Any], *, no_color: bool = False) -> str
     selectedTools = result.get("selected_tool_names", [])
     if selectedTools:
         lines.append("selected_tools=" + ", ".join(selectedTools[:8]))
+    if metadata.get("answer_model_used"):
+        lines.append("router_model=" + str(metadata["router_model"]))
+        lines.append("subagent_model=" + str(metadata["subagent_model"]))
+        lines.append("answer_model=" + str(metadata["answer_model"]))
     for toolResult in result.get("tool_results", [])[:3]:
         tool = toolResult.get("tool", {})
         toolName = tool.get("tool_name", "unknown_tool")
@@ -296,46 +282,6 @@ def _streamText(text: str) -> None:
             print(" ", end="", flush=True)
         print(chunk, end="", flush=True)
     sys.stdout.flush()
-
-
-def _formatTools(
-    tools: list[dict[str, Any]],
-    *,
-    no_color: bool,
-) -> str:
-    if not tools:
-        return "No matching tools."
-    lines = [_color("matching tools", "cyan", no_color)]
-    for tool in tools:
-        lines.append(f"- {tool['tool_name']}: {tool['method']} {tool['path']}")
-    return "\n".join(lines)
-
-
-def _formatRag(result: dict[str, Any], *, no_color: bool) -> str:
-    matches = result.get("matches", [])
-    lines = [
-        _color("rag", "cyan", no_color)
-        + f": mode={result.get('mode')} matches={len(matches)}"
-    ]
-    for match in matches[:3]:
-        lines.append(f"- {match['title']}: {match['snippet'][:220]}")
-    return "\n".join(lines)
-
-
-def _formatMemory(
-    title: str,
-    matches: list[dict[str, Any]],
-    *,
-    no_color: bool,
-) -> str:
-    lines = [_color(title, "cyan", no_color) + f": matches={len(matches)}"]
-    for match in matches[:8]:
-        event = match.get("event", {})
-        if not isinstance(event, dict):
-            continue
-        summary = event.get("user_input") or event.get("tool_name") or event
-        lines.append(f"- {match['file']}:{match['line_number']} {summary}")
-    return "\n".join(lines)
 
 
 def _color(text: str, color: str, no_color: bool) -> str:
